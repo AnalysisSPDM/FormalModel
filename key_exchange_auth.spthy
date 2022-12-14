@@ -1,0 +1,1950 @@
+theory spdm_kex
+begin
+
+builtins: signing, multiset, hashing, diffie-hellman, symmetric-encryption
+functions: sid/2, hkdf/3, hmac/2
+
+restriction OneSharedPK:
+"
+All idI idR #i #j. OneSharePK(idI, idR)@#i & OneSharePK(idI, idR)@#j ==> #i=#j   
+"
+
+restriction OneCertificate:
+"
+All id #i #j. OneCert(id)@#i & OneCert(id)@#j ==> #i=#j   
+"
+
+/*Create only one Root Certificate (for simplicity) */
+restriction SingleRootCert:
+"
+All #i #j. RootOnce()@i & RootOnce()@j ==> #i = #j
+"
+
+#ifdef fast
+restriction ResUniqueThreadsInit:
+"
+All tid oidI oidR oidI2 oidR2 #i #j. CurrentThreadI(tid,oidI,oidR)@i &
+                                     CurrentThreadI(tid,oidI2,oidR2)@j
+                                     ==> oidI=oidI2 & oidR=oidR2  
+"
+
+restriction ResUniqueThreadsResp:
+"
+All tid oidI oidI2 oidR oidR2 #i #j. CurrentThreadR(tid,oidI,oidR)@i &
+                          CurrentThreadR(tid,oidI2,oidR2)@j
+                          ==> oidR=oidR2  & oidI=oidI2
+"
+
+#endif
+
+//Init expiration of old thread id
+restriction resetGetVersionInit:
+"
+All tid1 tid2 oidI oidR #i #j. StartThreadI(tid1,oidI,oidR)@i & StartThreadI(tid2,oidI,oidR)@j & i<j 
+           ==> (All #k. CurrentThreadI(tid1, oidI, oidR)@k & j<k==> F)
+"
+
+//Update keys restriction
+
+restriction updateKey:
+" All tid sid kuid1 kuid2 #i #j.  KeyUpdate(tid, sid, kuid1)@i & KeyUpdate(tid, sid, kuid2)@j & i<j 
+           ==> (All #k.  CurrentKey(tid, sid, kuid1)@k & j<k==> F)
+"
+
+restriction singleKeyUpdate:
+"
+All tid sid kuid #i #j. OnlyOnce(tid, sid, kuid)@i & OnlyOnce(tid, sid, kuid)@j ==> #i = #j
+"
+
+//End Session invalidates the session id and its keys
+restriction rep_endSession:
+" All tid sid oidI oidR #i. RespEndSession(sid, tid, oidI, oidR)@i 
+           ==> not(Ex #j.  CurrentSesion(tid, sid)@j & i<j)
+"
+
+restriction init_endSession:
+" All tid sid oidI oidR #i. InitEndSession(sid, tid, oidI, oidR)@i 
+           ==> not(Ex #j.  CurrentSesion(tid, sid)@j & i<j)
+"
+
+/*
+Standard equality restrictions
+*/
+restriction equality:
+    "All x y #i. Eq(x, y) @ i ==> x = y"
+
+restriction inequality:
+    "All x y #i. Neq(x, y) @ i ==> not(x = y)"
+
+
+/*****************************************
+*
+* INITIALIZE DEVICES
+*
+*****************************************/
+
+// We for now decided for a single root certificate and no certificate hierarchy
+// This also means that we do not make any difference between DeviceCertificates
+// and AliasCertificates for now
+rule CreateRootCert[color= F9C74F]:
+    [ Fr(~ltk)]
+  --[ CreateRootCert(~ltk), RootOnce() ]->
+    [ !RootCert(~ltk),
+      !TrustAnchor(pk(~ltk)),
+      Out(pk(~ltk)) ] 
+
+
+// Create a Device with a unique ID, supported versions
+// ,supported capabilities and supported algorithms.
+
+
+rule createDevice:
+    let
+       V = <v1, v2>
+       A = <a1, a2>
+       C = capabilities
+    in
+    [ Fr(~oid),
+      In(capabilities),
+      Fr(~measure),
+      In(<v1, v2>),
+      In(<a1, a2>)]
+  --[ IsValidVersion(v1),
+      IsValidVersion(v2),
+      IsValidAlgo(a1),
+      IsValidAlgo(a2)]->
+    [ !Device(~oid, V, C, A),
+      !Measurement(~oid, ~measure),
+      Out(~oid) ]
+
+
+rule sharePSK:
+    [ !Device(~oid1,V1,'PSK' + C1,A1), !Device(~oid2,V2,'PSK' + C2,A2), Fr(~key) ]
+  --[  ]->
+    [ !PSK(~oid1,~oid2,~key), !PSK(~oid2, ~oid1, ~key) ]
+
+
+rule sharePK:
+    [ Fr(~ltk1), Fr(~ltk2), !Device(~oid1,V1,C1,A1), !Device(~oid2,V2,C2,A2) ]
+  --[ OneSharePK(~oid1,~oid2), OneSharePK(~oid2,~oid1), SecretLtk(~ltk1), SecretLtk(~ltk2) ]->
+    [ !SharedPK(~oid1,~oid2,pk(~ltk1),pk(~ltk2)),
+      !LTK(~oid1,~ltk1), !LTK(~oid2,~ltk2), 
+      Out(pk(~ltk1)), Out(pk(~ltk2))  ]
+
+rule A_getCertHonest:
+  let
+    cert = sign(<~oid, pk(~ltk)>,~rootkey)
+  in
+    [ !Device(~oid,V,C,A), !RootCert(~rootkey), Fr(~ltk) ]
+  --[ OneCert(~oid), Honest(~oid,~ltk,pk(~ltk)) ]->
+    [ !LTK(~oid,~ltk),!PK(~oid,pk(~ltk)), !Cert(~oid, pk(~ltk), cert), Out(<pk(~ltk),cert>) ]
+
+rule getCertAttacker:
+  let
+    cert = sign(<~oid, pk(~ltk)>,~rootkey)
+  in
+    [ In(~oid), !RootCert(~rootkey), Fr(~ltk) ]
+  --[ Attacker(~oid,~ltk,pk(~ltk)) ]->
+    [ !PK(~oid,pk(~ltk)), Out(<~ltk,~oid,cert>) ]
+
+
+/*****************************************
+*
+* V-C-A
+*
+*****************************************/
+
+rule I_Version_FirstRequest[color=2ec4b6]:
+    let 
+      message = <'Get_Version', '1'>
+      VCATranscript = <'Get_Version',message>
+                    + <'Version','NULL'>
+                    + <'Get_Capabilities','NULL'>
+                    + <'Capabilities','NULL'>
+                    + <'Negotiate_Algorithms','NULL'>
+                    + <'Algorithms','NULL'>
+    in
+    [ !Device(~oid, V, C, A), !Device(~oidR, VR, CR, AR), Fr(~tid) ]
+  --[ Channel(~oid,~oidR), 
+      StartThreadI(~tid,~oid,~oidR),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      VCATranscriptI(VCATranscript)
+     ]->
+    [ StateInit(~tid, ~oid, ~oidR, '1', 'NULL', <V,C,A>, VCATranscript, 'NULL', 'NULL', 'NULL', 'START_GETVERSION'),
+      Out(message)
+    ]
+/*The initiator resp wiht the version and starts a thread. 
+/Adding the Init device as input mimics the underlying layer: if it receives another get version request,
+the Respo knows for which communication channel it is intended.
+*/
+rule R_Version_FirstResponse[color=2ec4b6]:
+    let 
+      message_inp = <'Get_Version', '1'>
+      message_out = <'Version', V>
+      VCATranscript = <'Get_Version',message_inp>
+                    + <'Version',message_out>
+                    + <'Get_Capabilities','NULL'>
+                    + <'Capabilities','NULL'>
+                    + <'Negotiate_Algorithms','NULL'>
+                    + <'Algorithms','NULL'>
+    in
+    [ !Device(~oid, V, C, A), !Device(~oidI, VI, CI, AI), 
+      Fr(~tid),
+      In(message_inp) ]
+  --[ StartThreadR(~tid, ~oidI, ~oid),
+      CurrentThreadR(~tid,~oidI, ~oid),
+      VCATranscriptR(VCATranscript)
+  ]->
+    [ StateResp(~tid, ~oidI, ~oid, '1', 'NULL', <V,C,A>, VCATranscript, 'NULL', 'NULL', 'NULL', 'RESP_GETVERSION'),
+      Out(message_out) ]
+
+
+
+
+rule I_Capabilities_Request[color=F9844A]:
+    let
+      message_inp = <'Version', VR>
+      message_out = <'Get_Capabilities', vx, C>
+      VER = <'Version', message_inp>
+      GETCAP = <'Get_Capabilities', message_out>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, '1', 'NULL', <V,C,A>, <'Version',trash1> + <'Get_Capabilities',trash2> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETVERSION'),
+      In(message_inp), In(vx) ]
+  --[ IsIn(vx,V), IsIn(vx,VR),
+      Version(~tid, vx),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      VCATranscriptI(<'Version',trash1> + <'Get_Capabilities',trash2> + VCATranscript)]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, 'NULL', <V,C,A>, VER + GETCAP + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETCAP'),
+      Out(message_out) ]
+
+
+
+rule R_Capabilities_Response[color=F9844A]:
+    let
+      message_inp = <'Get_Capabilities', vx, CI>
+      message_out = <'Capabilities', vx, C>
+      GETCAP = <'Get_Capabilities', message_inp>
+      CAP = <'Capabilities', message_out>
+    in
+    [ StateResp(~tid, ~oidI, ~oid, '1', 'NULL', <V,C,A>, <'Get_Capabilities','NULL'> + <'Capabilities','NULL'> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'RESP_GETVERSION'),
+      In(message_inp) ]
+  --[ Version(~tid, vx),
+      CurrentThreadR(~tid, ~oidI, ~oid),
+      VCATranscriptR(<'Get_Capabilities','NULL'> + <'Capabilities','NULL'> + VCATranscript)
+  ]->
+    [ StateResp(~tid, ~oidI, ~oid, vx, 'NULL', <V,C,A>, GETCAP + CAP + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'RESP_GETCAPABILITIES'),
+      Out(message_out) ]
+
+
+
+rule I_Algorithms_Request[color=F9844A]:
+    let
+      message_inp = <'Capabilities', vx, CR>
+      message_out = <'Negotiate_Algorithms', vx, A>
+      CAP = <'Capabilities', message_inp>
+      NEGALG = <'Negotiate_Algorithms', message_out>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, 'NULL', <V,C,A>, <'Capabilities','NULL'> + <'Negotiate_Algorithms','NULL'> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETCAP'),
+      In(message_inp) ]
+  --[ Version(~tid, vx),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      VCATranscriptI(<'Capabilities','NULL'> + <'Negotiate_Algorithms','NULL'> + VCATranscript)]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, 'NULL', <V,C,A>, CAP + NEGALG + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETALGORITHMS'),
+      Out(message_out) ]
+
+
+
+rule R_Algorithms_Response[color=F9844A]:
+    let
+      message_inp = <'Negotiate_Algorithms', vx, AI>
+      message_out = <'Algorithms', vx, ax>
+      NEGALG = <'Negotiate_Algorithms', message_inp>
+      ALG = <'Algorithms', message_out>
+    in
+    [ StateResp(~tid, ~oidI, ~oid, vx, 'NULL', <V,C,A>, <'Negotiate_Algorithms','NULL'> + <'Algorithms','NULL'> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'RESP_GETCAPABILITIES'),
+      In(message_inp), In(ax) ]
+  --[ IsIn(ax,AI), IsIn(ax,A),
+      Version(~tid, vx),
+      CurrentThreadR(~tid,~oidI,~oid),
+      RespReachVCA(~tid,~oidI,~oid),
+      VCATranscriptR(<'Negotiate_Algorithms','NULL'> + <'Algorithms','NULL'> + VCATranscript)
+  ]->
+    [ StateResp(~tid, ~oidI, ~oid, vx, ax, <V,C,A>, NEGALG + ALG + VCATranscript, optionsTranscript, 'NULL', 'NULL','IDLE'),
+      Out(message_out) ]
+
+
+
+rule I_Algorithms_ProcessResponse[color=F9844A]:
+    let
+      message_inp = <'Algorithms', vx, ax>
+      ALG = <'Algorithms', message_inp>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, 'NULL', <V,C,A>, <'Algorithms','NULL'> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETALGORITHMS'),
+      In(message_inp) ]
+  --[ Version(~tid, vx),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      VCATranscriptI(<'Algorithms','NULL'> + VCATranscript),
+      InitReachVCA(~tid, ~oid, ~oidR) ]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, ALG + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'IDLE')
+     ]
+
+
+/*****************************************
+*
+* START SESSIONS
+*
+*****************************************/
+
+/*
+   KeyExchangeInit fields:
+    ~sid,  - start session id
+    ~tid,  - thread id
+    ~didI, - Device id of Initiator REMOVED
+    ~didR, - Device id of Responder REMOVED
+    ~sid, - (some session id to not allow the )
+    ~ltkI, - ltk of Initiator
+    somepkR, - public key of Responder
+    certI,   - vertificate of Initiator
+    VCATrancriptI,  - VCA Transcript from the options phase (here it is initialized with a string from the previous rule)
+    messageTranscript, -transcript for key exchange and finish
+    digest, -digest of the Responder
+    'NULL'/~newPrivKey,- field that will store the Diffie-Hellman private key
+    'NULL'/~initSessionId, - Field that will store the session id of the Initiator
+    'NULL'/handshake_secret, - field that will store the handshake_secret = hmac(dh_out, 'salt_o')
+    'NULL'/init_finished_key, - field that will store the Initiators finished key
+    'NULL'/resp_finished_key, -  field that will store the Responder finished key
+    'NULL'/bindSid, - sessionId derived by both partner sind(~initsid, ~respsid)
+    'WAIT_KEY_RESP' - state tha represents where you are in the protocol execution
+*/
+
+rule I_Spawn_new_PK_Session:
+  let
+      messageTranscript = <'Get_Key_Exchange','NULL'>
+                      + <'Key_Exchange_Resp','NULL'>
+                      + <'Finish','NULL'>
+                      + <'Finish_Rsp', 'NULL'>
+      in_cert = sign(<~oidR,in_pkR>,~rootkey)
+  in
+    [ StateInit(~tidI, ~oidI, ~oidR, version, axI, <VI,CI,AI>, VCATranscriptI, optionsTranscriptI, somePKR, digestR,'IDLE')
+    ,  In(<in_pkR, in_cert>) // During the Options phase the Init can receive any certificate
+    ,  !RootCert(~rootkey)
+    , Fr(~sid)
+     ]
+  --[ Version(~tidI, version),
+      CurrentThreadI(~tidI, ~oidI, ~oidR),
+      IStartKEX(~sid,~tidI,~oidI,~oidR),
+      KETranscriptI(messageTranscript),
+      IStoredCert(~tidI, ~oidI, ~oidR, in_pkR, in_cert)
+    ]->
+    [ StateInit(~tidI, ~oidI, ~oidR, version, axI, <VI,CI,AI>, VCATranscriptI, optionsTranscriptI, in_pkR, h(in_cert),'IDLE')
+    , KeyExchangeInit(~sid, ~tidI, ~oidI, ~oidR, in_pkR, h(in_cert), version, VCATranscriptI, messageTranscript, 'NULL', 'NULL','NULL', 'NULL', 'NULL', 'NULL', 'START_KE') 
+    ]
+
+rule R_Spawn_new_PK_Session:
+  let
+      messageTranscript = <'Get_Key_Exchange','NULL'>
+                      + <'Key_Exchange_Resp','NULL'>
+                      + <'Finish','NULL'>
+                      + <'Finish_Rsp', 'NULL'>
+  in
+    [ StateResp(~tidR, ~oidI, ~oidR, version, axR, <VR,CR,AR>, VCATranscriptR, optionsTranscriptR, pubKI, digestI, 'IDLE')
+    , Fr(~sid) ]
+  --[ Version(~tidR, version),
+      CurrentThreadR(~tidR, ~oidI, ~oidR),
+      RStartKEX(~sid, ~tidR, ~oidI,~oidR),
+      KETranscriptR(messageTranscript)
+    ]->
+    [ StateResp(~tidR, ~oidI, ~oidR, version, axR, <VR,CR,AR>, VCATranscriptR, optionsTranscriptR, pubKI, digestI, 'IDLE')
+    , KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, pubKI, digestI, version, VCATranscriptR, messageTranscript, 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'START_KE') ]
+
+
+/* TH for KEY_EXCHANGE response signature: Concatenate (VCA, Ct, K)
+ * Ct = certificate chain
+ * K  = Concatenate (KEY_EXCHANGE request, KEY_EXCHANGE response\signature+verify_data)
+
+ TH for KEY_EXCHANGE response HMAC: Concatenate (A, Ct, K)
+ * Ct = certificate chain
+ * K  = Concatenate (KEY_EXCHANGE request, KEY_EXCHANGE response\verify_data)*/
+
+/* Initiator starts a Key_Exchange Request.
+   They generate a ~nonce, their part of the session if ~initSessionId, and a Diffie-Hellman key.
+   
+   SessionId, private key of DH are stored in the state, while the nonce is stored in the message transcript, 
+   as part of the request.
+*/
+
+rule I_KE_Request[color=43AA8B]:
+    let
+      publicKey = 'g'^~newPrivKey
+      message=<'Get_Key_Exchange', version, ~initSessionId, ~nonce, publicKey>
+      new_messageTranscript = <'Get_Key_Exchange',message> + messageTranscript
+    in
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, pkR, digestR, version, VCATrancriptI, <'Get_Key_Exchange', gke> + messageTranscript, 'NULL', 'NULL','NULL', 'NULL', 'NULL', 'NULL', 'START_KE') 
+    , Fr(~nonce)
+    , Fr(~newPrivKey)
+    , Fr(~initSessionId) 
+    ]
+  --[  Version(~tid, version),
+       CurrentThreadI(~tid, ~oidI, ~oidR),
+       StartKeyExchange(~sid, ~tid, ~oidI, ~oidR, ~initSessionId),
+      KETranscriptI( <'Get_Key_Exchange', gke> + messageTranscript)]-> 
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, pkR, digestR, version, VCATrancriptI, new_messageTranscript, ~newPrivKey, ~initSessionId,'NULL', 'NULL', 'NULL', 'NULL', 'WAIT_KEY_RESP') 
+    , Out(message)
+     ]
+
+//Currently without mutual Auth option.  
+//ResponderVerifyData is conditional
+/* Responder's response to KE_Request.
+  1. Responder, generates a DH key, a nonce and the session id part.
+  2. Computes and stores the new session id: sessionId=sid(~initSessionId,~respSessionId)
+  3. Computes the DH output from the Init public key and its private key: dh_out=publicKey^~respPrivKey
+  4.1 Computes the transcript to be signed:
+
+      * TH for KEY_EXCHANGE response signature: Concatenate (VCA, Ct, K)
+      * Ct = certificate chain
+      * K  = Concatenate (KEY_EXCHANGE request, KEY_EXCHANGE response\signature+verify_data)
+
+      * TH for KEY_EXCHANGE response HMAC: Concatenate (A, Ct, K)
+      * Ct = certificate chain
+      * K  = Concatenate (KEY_EXCHANGE request, KEY_EXCHANGE response\verify_data)
+
+  4.2 The transcript fo the signature does not include the signature/HMAC fild.
+      The transcript for the HMAC includes the signature field, but no the HMAC (since its the one being calculated).
+  5. Responder calculated the handshake_secret, Direction-specific handshake secrets and the finished keys.
+  6. The reply is sent to the Initiator and the state is changed to 'REPLIED_KE'
+
+*/
+rule R_KE_Response[color=43AA8B]:
+    let
+        //new session id 
+        bindSid= sid(initSessionId,~respSessionId)
+        //message input and dervie  DH out
+        message_inp=<'Get_Key_Exchange', version, initSessionId, nonce, publicKey>
+        dh_out=publicKey^~respPrivKey
+        respPublicKey= 'g'^~respPrivKey
+        //create transcript for signature
+        message_without_signature= <'Key_Exchange_Resp', version, ~respSessionId, 'No_Mutual_auth', ~respNonce, respPublicKey, 'NULL', 'NULL'>
+        messageTranscript_forSign = <'Get_Key_Exchange', message_inp> 
+                                  + <'Key_Exchange_Resp', message_without_signature>
+                                  + messageTranscript
+        K1_Transcript=<version, 'Key_Exchange_Resp_Signing', VCATrancript,  h(certR), messageTranscript_forSign>
+        signature=sign(h(K1_Transcript),~ltkR)
+
+        //create trascript without ResponderVerifyData for HMAC
+        message_with_sign= <'Key_Exchange_Resp', version, ~respSessionId, 'No_Mutual_auth', ~respNonce, respPublicKey, signature, 'NULL'>
+        messageTranscript_forHMAC = <'Get_Key_Exchange', message_inp> 
+                                  + <'Key_Exchange_Resp', message_with_sign>
+                                  + messageTranscript
+        K1_Transcript_HMAC=<VCATrancript, h(certR), messageTranscript_forHMAC>
+        //derive init and resp finished key for HMAC
+        TH1= h(K1_Transcript_HMAC)
+        handshake_secret=hmac(dh_out, 'salt_o')
+        resp_handshake_secret=hkdf(handshake_secret, TH1, 'resp_hs_data') 
+        init_handshake_secret=hkdf(handshake_secret, TH1, 'init_hs_data') 
+        resp_finished_key= hkdf(resp_handshake_secret, version, 'finished')
+        init_finished_key= hkdf(init_handshake_secret, version, 'finished')
+
+        respVerifyData= hmac(h(K1_Transcript_HMAC), resp_finished_key)
+        message_out= <'Key_Exchange_Resp', version, ~respSessionId, 'No_Mutual_auth', ~respNonce, respPublicKey, sign(h(K1_Transcript),~ltkR), hmac(h(K1_Transcript_HMAC), resp_finished_key)>
+        new_messageTranscript=  <'Get_Key_Exchange', message_inp> 
+                          + <'Key_Exchange_Resp', message_out>
+                          + messageTranscript
+    in
+    [ KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, somepkI, somedigestI, version, VCATrancript,<'Get_Key_Exchange', gke> + <'Key_Exchange_Resp', ker> + messageTranscript, 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'START_KE') 
+    , !Cert(~oidR, pk(~ltkR), certR),
+      Fr(~respNonce),
+      Fr(~respSessionId),
+      Fr(~respPrivKey),
+      In(message_inp) ]
+  --[ Version(~tidR, version),
+      CurrentThreadR(~tidR, ~oidI, ~oidR),
+      SendKEResponse(~sid, ~tidR, ~oidI, ~oidR, ~respSessionId),
+      RunningBeforeFinish(~sid, ~tidR, ~oidI, ~oidR, pk(~ltkR)),
+      SessionId(~tidR,~sid, sid(initSessionId,~respSessionId)),
+      DHOutputResp(~sid, ~tidR, ~oidI, ~oidR, ~ltkR, dh_out),
+      KETranscriptR(<'Get_Key_Exchange', gke> + <'Key_Exchange_Resp', ker> + messageTranscript)
+  ]->
+    [  KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, somepkI, somedigestI, version, VCATrancript, new_messageTranscript, 'NULL', handshake_secret, resp_finished_key, init_finished_key, bindSid, 'AFTER_KE') 
+     , Out(message_out) ]
+
+//Verify responderVerifyData and signature
+//compute handshake secret and finished_key
+/* Initiator receives the repsonse from the Responder.
+  1. Generates the DH output.
+  2. Creates the Transcripts in order to verify the signature and the HMAC sent from the responder.
+  3. Computes the handshake secrets and finished keys.
+  4. The state is forwarded to after the KEy_Exchange request 'AFTER_KE'
+*/
+rule I_KE_ProcessAndVerify[color=43AA8B]:
+    let
+      message_in =<'Key_Exchange_Resp', version, respSessionId, 'No_Mutual_auth', respNonce, respPublicKey, sign(h(K1_Transcript_Sign),~ltkR), hmac(h(K1_Transcript_HMAC), in_finished_key)>
+      signature = sign(h(K1_Transcript_Sign),~ltkR)
+      dh_out=respPublicKey^~privKey
+      initPublicKey= 'g'^~privKey
+      //transcript without signature
+      message_without_signature=<'Key_Exchange_Resp', version, respSessionId, 'No_Mutual_auth', respNonce, respPublicKey, 'NULL', 'NULL'>
+      messageTranscript_Sign= messageTranscript + <'Key_Exchange_Resp', message_without_signature>
+      K2_Transcript_Sign=<version, 'Key_Exchange_Resp_Signing', VCATrancriptI, digest, messageTranscript_Sign>
+      //transcript for HMAC
+      message_with_sign= <'Key_Exchange_Resp', version, respSessionId, 'No_Mutual_auth', respNonce, respPublicKey, sign(h(K1_Transcript_Sign),~ltkR), 'NULL'>
+      messageTranscript_forHMAC = messageTranscript+ <'Key_Exchange_Resp', message_with_sign>
+      K2_Transcript_HMAC=<VCATrancriptI, digest, messageTranscript_forHMAC>
+      //finished_key for HMAC
+      TH1= h(K2_Transcript_HMAC)
+      handshake_secret=hmac(dh_out, 'salt_o')
+      resp_handshake_secret=hkdf(handshake_secret, TH1, 'resp_hs_data') 
+      init_handshake_secret=hkdf(handshake_secret, TH1, 'init_hs_data') 
+      resp_finished_key= hkdf(resp_handshake_secret, version, 'finished')
+      init_finished_key= hkdf(init_handshake_secret, version, 'finished')
+
+      //new session id 
+      bindSid= sid(~initSessionId,respSessionId)
+      //new key exchange message transcript
+      new_messageTranscript= messageTranscript+ <'Key_Exchange_Resp', message_in>
+    in
+    [  KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATrancriptI,  <'Key_Exchange_Resp',rsp>+ messageTranscript, ~privKey, ~initSessionId,'NULL', 'NULL', 'NULL', 'NULL', 'WAIT_KEY_RESP')
+    , In(message_in)
+    ]
+  --[  Version(~tid, version),
+       CurrentThreadI(~tid, ~oidI, ~oidR),
+       SessionId(~tid, ~sid, bindSid),
+       ReceiveKeyExchange(~sid,~tid, ~oidI, ~oidR),
+       KETranscriptI( <'Key_Exchange_Resp',rsp>+messageTranscript),
+       DHOutputInit(~sid, ~tid, ~oidI, ~oidR, somepkR, dh_out),
+       CommitBeforeFinish(~sid, ~tid, ~oidI, ~oidR, somepkR),
+       Eq(verify(signature,h(K1_Transcript_Sign),somepkR),true),
+       Eq(K1_Transcript_Sign,K2_Transcript_Sign),
+       Eq(in_finished_key, resp_finished_key),
+       Eq(K1_Transcript_HMAC,K2_Transcript_HMAC)
+       ]->
+    [  KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATrancriptI,  new_messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'AFTER_KE') 
+       ]
+
+
+/*****************************************
+*
+* FINISH KEY EXCHANGE WITHOUT MUTUAL AUTHENTICATION
+*
+*****************************************/
+
+/* 
+  Initiator sends a Finish Request in which it includes an HMAC of the transcript so far.
+  No Mutual Authentication has been performed before this rule.
+  Finish Request does not include a signature without having done before mutual authentication.
+    1. Compute the HMAC over the transcript:
+
+      * TH for FINISH request: Concatenate (A, Ct, K, (Mutual_Auth), F)
+      * Ct = certificate chain
+      * K  = Concatenate (KEY_EXCHANGE request, KEY_EXCHANGE response)
+      * F  = Concatenate (FINISH request\signature+verify_data)
+
+*/
+rule I_Finish_Request[color=43AA8B]:
+    let
+      //transcript for HMAC
+      message_header_fields=< 'Finish', version, 'NULL'>
+      messageTranscript_HMAC = messageTranscript + <'Finish', message_header_fields>
+      K2_Transcript_HMAC=<VCATranscript, digest, messageTranscript_HMAC>
+
+      //initiator HMAC
+      initVerifyData= hmac(h(K2_Transcript_HMAC), init_finished_key)
+      message_out=<'Finish', version, initVerifyData>
+      // new message transcript with the finished header values
+      new_messageTranscript=messageTranscript + <'Finish', message_out>
+
+    in
+    [  KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript, <'Finish',f>+messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'AFTER_KE') 
+      ]
+  --[ Version(~tid, version),
+      CurrentThreadI(~tid, ~oidI, ~oidR),
+      SessionId(~tid, ~sid, bindSid),
+      StartFinishKE(~sid, ~tid, ~oidI, ~oidR),
+      KETranscriptI(<'Finish',f>+messageTranscript)
+       ]->
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript, new_messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'PROCESS_FINISH_REQUEST') 
+     ,  Out(message_out)
+     ]
+
+
+/* Responder verifies the HMAC and computes an HMAC over its transcript so far.
+  1. Verify the Initiator HMAC.
+  2. Compute Responder's Transcript and HMAC with its finished_key:
+
+    * TH for FINISH response HMAC: Concatenate (A, Ct, K, (Mutual_Auth), F)
+    * Ct = certificate chain
+    * K = Concatenate (KEY_EXCHANGE request, KEY_EXCHANGE response)
+    * F = Concatenate (FINISH request\verify_data)
+
+  3.  Compute and store the secrets for the session phase. 
+    * master_secret
+    * direction-specific master_secrets
+    * keys for encryption and decryption.
+  4. Create the new state for the session phase:
+
+  5. AppDataResp fields:
+      ~cid, - Channel id
+      ~didR, - Responder device id
+      ~didI, - Initiator device id
+      bindSid, - session id derived by both parties
+      ~ltkR, -ltk of Repsonder
+      resp_master_secret, - master secret of Responder. 
+      init_master_secret, - master secret of Initiator
+      encrypt_key, - key to encrypt messages in the session phase
+      decrypt_key  - key to decrypt the messages received by the Initiator
+*/
+rule R_Finish_Response[color=43AA8B]:
+    let
+        //message input and dervie  DH out
+        message_inp=<'Finish', version, hmac(h(K2_Transcript_HMAC), in_finished_key)>
+
+        //transcript for HMAC
+        message_header_fields=<'Finish', version, 'NULL'>
+        messageTranscript_HMAC = messageTranscript + <'Finish', message_header_fields> + <'Finish_Rsp', 'NULL'>
+        K1_Transcript_HMAC=<VCATrancript, h(certR), messageTranscript_HMAC>
+
+        //transcript for response HMAC
+        message_out_header_fields=<'Finish_Rsp', version, 'NULL'>
+        messageTranscript_RespHMAC = messageTranscript + <'Finish', message_inp> + message_out_header_fields
+        K_Transcript_HMAC=<VCATrancript, h(certR), messageTranscript_RespHMAC>
+        respVerifyData= hmac(h(K_Transcript_HMAC), resp_finished_key)
+        message_out= <'Finish_Rsp', version, respVerifyData>
+
+        // create session with new secrets
+        TH2= messageTranscript + <'Finish', message_inp> + <'Finish_Rsp', message_out>
+        master_secret=hmac(hkdf(handshake_secret, version, 'derived'), '0_filled')
+        resp_master_secret=hkdf(master_secret, TH2, 'resp_app_data')
+        init_master_secret=hkdf(master_secret, TH2, 'init_app_data')
+        encrypt_key=hkdf(resp_master_secret, version, 'key')
+        decrypt_key=hkdf(init_master_secret, version, 'key')
+    in
+    [  KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, somepkI, somedigestI, version, VCATrancript, <'Finish','NULL'>+ <'Finish_Rsp', 'NULL'>+messageTranscript, 'NULL', handshake_secret, resp_finished_key, init_finished_key, bindSid, 'AFTER_KE') 
+     , !Cert(~oidR, pk(~ltkR), certR)
+     , In(message_inp)
+     , Fr(~kuid) // id to indetify key updates
+     ]
+  --[ Version(~tidR, version),
+      CurrentThreadR(~tidR, ~oidI, ~oidR),
+      RespFinish(~sid, ~tidR, ~oidI, ~oidR),
+      SessionId(~tidR, ~sid, bindSid),
+      KETranscriptR(<'Finish','NULL'>+ <'Finish_Rsp', 'NULL'>+messageTranscript),
+      SesssionMajorSecretResp(~sid, ~tidR, ~oidI, ~oidR, ~ltkR, handshake_secret),
+      Running(~sid, ~tidR, pk(~ltkR), handshake_secret, TH2, 'Resp'),
+      KeyUpdate(~tidR, ~sid, ~kuid),
+      Eq(init_finished_key, in_finished_key),
+      Eq(K1_Transcript_HMAC,K2_Transcript_HMAC)
+  ]->
+    [ !AppDataKey(~kuid, ~tidR, ~sid, ~oidI, ~oidR, bindSid, version, resp_master_secret, init_master_secret, encrypt_key, decrypt_key, 'Resp')
+    , Out(message_out) ]
+
+
+rule I_Finish_ProcessAndVerify[color=43AA8B]:
+    let
+      message_in =<'Finish_Rsp', version, hmac(h(K1_Transcript_HMAC), in_finished_key)>
+
+      //transcript for response HMAC
+      message_in_header_fields=<'Finish_Rsp', version, 'NULL'>
+      transcript_temp= messageTranscript + message_in_header_fields
+      K2_Transcript_HMAC=<VCATranscript, digest, transcript_temp>
+
+      // create session with new secrets
+      TH2= messageTranscript + <'Finish_Rsp', message_in>
+      master_secret=hmac(hkdf(handshake_secret, version, 'derived'), '0_filled')
+      resp_master_secret=hkdf(master_secret, TH2, 'resp_app_data')
+      init_master_secret=hkdf(master_secret, TH2, 'init_app_data')
+      decrypt_key=hkdf(resp_master_secret, version, 'key')
+      encrypt_key=hkdf(init_master_secret, version, 'key')
+    in
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript, <'Finish_Rsp', 'NULL'>+ messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'PROCESS_FINISH_REQUEST') 
+    , !Cert(~oidI, pk(~ltkI), certI)
+    , In(message_in)
+    , Fr(~kuid)
+    ]
+  --[  Version(~tid, version),
+       CurrentThreadI(~tid, ~oidI, ~oidR),
+       SessionId(~tid, ~sid, bindSid),
+       ReceiveFinish(~sid, ~tid, ~oidI, ~oidR),
+       KETranscriptI(<'Finish_Rsp', 'NULL'>+messageTranscript),
+       SesssionMajorSecretInit(~sid, ~tid, ~oidI, ~oidR, somepkR, handshake_secret),
+       Commit(~sid, ~tid, pk(~ltkI), somepkR, handshake_secret, TH2, 'Init'),
+       KeyUpdate(~tid, ~sid, ~kuid),
+       Eq(in_finished_key, resp_finished_key),
+       Eq(K1_Transcript_HMAC,K2_Transcript_HMAC)
+       ]->
+    [ //AppData(~tid, ~sid, ~oidI, ~oidR, bindSid, ~kuid, version, 'NULL', 'NULL', 'Init', 'Session')
+     !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, init_master_secret, resp_master_secret, encrypt_key, decrypt_key, 'Init')
+     ]
+
+
+/*****************************************
+*
+* MUTUAL AUTHENTICATION
+*
+*****************************************/
+
+// Initiator sends is digets to the responder
+rule I_DeliverEncap_SendDigest[color=43AA8B]:
+    let
+      digest_init = h(certI)
+      message_out= <'Deliver_Encap_Digest', version, digest_init>
+    in
+    [  KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript, messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'AFTER_KE') 
+    , !Cert(~oidI, pk(~ltkI), certI)
+    ]
+  --[  Version(~tid, version),
+       CurrentThreadI(~tid, ~oidI, ~oidR),
+       SessionId(~tid, ~sid, bindSid),
+       SendEncapsulatedDigest(~sid, ~tid, ~oidI, ~oidR),
+       KETranscriptI(messageTranscript)
+       ]->
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript, messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'SENT_DIGEST') 
+    , Out(message_out)
+     ]
+
+// Responder received digest, store it and sends a get certificate request
+rule R_EncapsResponseAck_RecvDigestGetCertificate[color=43AA8B]:
+    let
+      message_in= <'Deliver_Encap_Digest', version, digest_init>
+      message_out= <'Encap_Ack_GetCertificate', version>
+    in
+    [ KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, somepkI, somedigestI, version, VCATrancript, messageTranscript, 'NULL', handshake_secret, resp_finished_key, init_finished_key, bindSid, 'AFTER_KE')  
+    , In(message_in) ]
+  --[ Version(~tidR, version),
+      CurrentThreadR(~tidR, ~oidI, ~oidR),
+      SessionId(~tidR, ~sid, bindSid),
+      ReceivedEncapsulatedDigest(~sid, ~tidR, ~oidI, ~oidR),
+      KETranscriptR(messageTranscript)
+      ]->
+    [ KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, somepkI, digest_init, version, VCATrancript, messageTranscript, 'NULL', handshake_secret, resp_finished_key, init_finished_key, bindSid, 'ACK_DIGEST') 
+    , Out(message_out)
+     ]
+
+// Initiator received get certificate encapsulated request and sends the certificate
+rule I_DeliverEncap_SendCertificate[color=43AA8B]:
+    let
+      message_in= <'Encap_Ack_GetCertificate', version>
+      message_out= <'Deliver_Encap_Certificate', version, certI>
+    in
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript, messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'SENT_DIGEST')  
+    , In(message_in)
+    , !Cert(~oidI, pk(~ltkI), certI) ]
+  --[  Version(~tid, version),
+       CurrentThreadI(~tid, ~oidI, ~oidR),
+       SessionId(~tid, ~sid, bindSid),
+       SendEncapsulatedCertificate(~sid, ~tid, ~oidI, ~oidR),
+       KETranscriptI(messageTranscript)
+       ]->
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript, messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'SENT_CERTIFICATE')  
+    , Out(message_out)
+     ]
+
+// Responder received certificate, stores certI and pkI, and sends ack
+/*  This function verify the integrity of the certificate chain.
+ * root_hash -> Root certificate -> Intermediate certificate -> Leaf certificate.
+ *
+ * If the peer root certificate hash is deployed,
+ * this function also verifies the digest with the root hash in the certificate chain.
+ *
+ * In addition Init pk and digest are stored in the memory of Resp, so that it can be used in another parallel session
+*/
+rule R_EncapsResponseAck_RecvCertificate[color=43AA8B]:
+    let
+      certI = sign(<~oidI, pk(~ltkI)>,~rootKey)
+      message_in= <'Deliver_Encap_Digest', version, certI>
+      message_out= <'Encap_Ack', version>
+    in
+    [ KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, somepkI, digest_init, version, VCATrancript, messageTranscript, 
+                      'NULL', handshake_secret, resp_finished_key, init_finished_key, bindSid, 'ACK_DIGEST') 
+    , !RootCert(~rootKey)
+    , StateResp(~tidR, ~oidI, ~oidR, version, somealg, <VR,CR,AR>, someVCATranscriptR, someoptionsTranscriptR, somepubKI, somedigestI, 'IDLE')
+    , In(message_in) ]
+  --[  Version(~tidR, version),
+       CurrentThreadR(~tidR, ~oidI, ~oidR),
+       SessionId(~tidR, ~sid, bindSid),
+       ReceiveInitCertificate(~sid, ~tidR, ~oidI, ~oidR),
+       KETranscriptR(messageTranscript),
+       RStoredCert( ~tidR, ~oidI, ~oidR, pk(~ltkI), certI),
+       Eq(h(certI),digest_init)
+       ]->
+    [ KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, pk(~ltkI), digest_init, version, VCATrancript, messageTranscript, 
+                      'NULL', handshake_secret, resp_finished_key, init_finished_key, bindSid, 'ACK_CERTIFICATE') 
+     , StateResp(~tidR, ~oidI, ~oidR, version, somealg, <VR,CR,AR>, someVCATranscriptR, someoptionsTranscriptR, pk(~ltkI), digest_init, 'IDLE')
+     , Out(message_out)
+     ]
+
+/*****************************************
+*
+* MUTUAL AUTHENTICATION WITH OLD CERT
+*
+*****************************************/   
+
+// If Responder has a stored cert SKIP to FINISH MUTUAL AUTH
+
+rule I_AuthWithOldCert_BeforeFinish[color=43AA88]:
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript, messageTranscript, 
+                      ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'AFTER_KE') ]
+  --[  Version(~tid, version),
+       CurrentThreadI(~tid, ~oidI, ~oidR),
+       SessionId(~tid, ~sid, bindSid),
+       KETranscriptI(messageTranscript),
+       IBeforeAuthOldCert(~sid, ~tid, ~oidI, ~oidR)
+       ]->
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript, messageTranscript, 
+                    ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'SENT_CERTIFICATE')  
+    
+     ]
+
+rule R_AuthWithOldCert_BeforeFinish[color=43AA88]:
+    [ KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, somepkI, digest_init, version, VCATrancript, messageTranscript,
+                      'NULL', handshake_secret, resp_finished_key, init_finished_key, bindSid, 'AFTER_KE') 
+     ]
+  --[  Version(~tidR, version),
+       CurrentThreadR(~tidR, ~oidI, ~oidR),
+       SessionId(~tidR, ~sid, bindSid),
+       KETranscriptR(messageTranscript),
+       RBeforeAuthOldCert(~sid, ~tidR, ~oidI, ~oidR),
+       Neq(somepkI, 'NULL'),
+       Neq(digest_init, 'NULL')
+       ]->
+    [ KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, somepkI, digest_init, version, VCATrancript, messageTranscript, 
+                    'NULL', handshake_secret, resp_finished_key, init_finished_key, bindSid, 'ACK_CERTIFICATE')  
+    
+     ]
+
+
+/*****************************************
+*
+* FINISH KEY EXCHANGE WITH MUTUAL AUTHENTICATION
+*
+*****************************************/
+
+/* 
+  Initiator sends a Finish Request in which it includes an HMAC of the transcript so far.
+  No Mutual Authentication has been performed before this rule.
+  Finish Request does not include a signature without having done before mutual authentication.
+    1. Compute the HMAC over the transcript:
+
+      * TH for FINISH request: Concatenate (A, Ct, K, Mutual_Auth, F)
+      * Ct = certificate chain
+      * K  = Concatenate (KEY_EXCHANGE request, KEY_EXCHANGE response)
+      * CM = mutual certificate chain 
+      * F  = Concatenate (FINISH request\signature+verify_data)
+
+*/
+rule I_FinishMutualAuth_Request[color=43AA8B]:
+    let
+      // receive ack from encap cert
+      message_in= <'Encap_Ack', version>
+      //transcript for HMAC
+      finish_header_fields=<'Finish', version, 'NULL'>
+      //messageTranscript_HMAC = messageTranscript + <'Finish', message_header_fields>
+      init_messageTranscript= <'Finish_Rsp', 'NULL'>+<'Finish',finish_header_fields>+ messageTranscript
+      K2_Transcript_sign=<VCATranscript, digest, init_messageTranscript, h(certI)>
+      //initiator calculates signature
+      init_signature= sign(h(K2_Transcript_sign), ~ltkI)
+
+      K2_Transcript_HMAC=<VCATranscript, digest, init_messageTranscript, h(certI), init_signature>
+      //initiator HMAC over transcript and signature
+      initVerifyData= hmac(h(K2_Transcript_HMAC), init_finished_key)
+
+      message_out=<'Finish', version, init_signature, initVerifyData>
+      // new message transcript with the finished header values
+      new_messageTranscript=messageTranscript + <'Finish', message_out>+ <'Finish_Rsp', 'NULL'>
+    
+    in
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript,<'Finish_Rsp', 'NULL'>+<'Finish','NULL'>+ messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'SENT_CERTIFICATE')  
+    , !Cert(~oidI, pk(~ltkI), certI)
+    , In(message_in)]
+  --[ Version(~tid, version),
+      CurrentThreadI(~tid, ~oidI, ~oidR),
+      SessionId(~tid, ~sid, bindSid),
+      ReceivedACK(~sid, ~tid, ~oidI, ~oidR),
+      StartFinishKEMutualAuth(~sid, ~tid, ~oidI, ~oidR),
+      KETranscriptI(<'Finish_Rsp', 'NULL'>+<'Finish','NULL'>+messageTranscript),
+      RunningMutAuth(~sid, ~tid, pk(~ltkI), somepkR, handshake_secret, new_messageTranscript,'Init')
+       ]->
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digest, version, VCATranscript,new_messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'PROCESS_FINISH_REQUEST_AUTH')  
+    , Out(message_out)
+     ]
+
+
+/* Responder verifies the HMAC and computes an HMAC over its transcript so far.
+  1. Verify the Initiator HMAC.
+  2. Compute Responder's Transcript and HMAC with its finished_key:
+
+    * TH for FINISH response HMAC: Concatenate (A, Ct, K, (Mutual_Auth), F)
+    * Ct = certificate chain
+    * K = Concatenate (KEY_EXCHANGE request, KEY_EXCHANGE response)
+    * F = Concatenate (FINISH request\verify_data)
+
+  3.  Compute and store the secrets for the session phase. 
+    * master_secret
+    * direction-specific master_secrets
+    * keys for encryption and decryption.
+  4. Create the new state for the session phase:
+
+  5. AppDataResp fields:
+      ~cid, - Channel id
+      ~didR, - Responder device id
+      ~didI, - Initiator device id
+      bindSid, - session id derived by both parties
+      ~ltkR, -ltk of Repsonder
+      resp_master_secret, - master secret of Responder. 
+      init_master_secret, - master secret of Initiator
+      encrypt_key, - key to encrypt messages in the session phase
+      decrypt_key  - key to decrypt the messages received by the Initiator
+*/
+rule R_FinishMutualAuth_Response[color=43AA8B]:
+    let
+        //message input and dervie  DH out
+        message_inp=<'Finish', version,  sign(h(K2_Transcript_sign),~ltkI), hmac(h(K2_Transcript_HMAC), in_finished_key)>
+        init_signature=  sign(h(K2_Transcript_sign),~ltkI)
+        //transcript for HMAC
+        finish_header_fields=<'Finish', version, 'NULL'>
+        init_messageTranscript= <'Finish_Rsp', 'NULL'>+ <'Finish',finish_header_fields>+messageTranscript
+        //transcript to verify the signature
+        K1_Transcript_sign=<VCATrancript, h(certR), init_messageTranscript, digest_init>
+        // transcript to verify the HMAC 
+        K1_Transcript_HMAC=<VCATrancript, h(certR), init_messageTranscript, digest_init, init_signature>
+
+        //transcript for response HMAC
+        messageTranscript_RespHMAC=messageTranscript + <'Finish', message_inp> + <'Finish_Rsp', <'Finish_Rsp', version, 'NULL'>>
+        K_Transcript_HMAC=<VCATrancript, h(certR), messageTranscript_RespHMAC, digest_init>
+        respVerifyData= hmac(h(K_Transcript_HMAC), resp_finished_key)
+        message_out= <'Finish_Rsp', version, respVerifyData>
+
+        // create session with new secrets
+        TH2= messageTranscript + <'Finish', message_inp> + <'Finish_Rsp', message_out>
+        master_secret=hmac(hkdf(handshake_secret, version, 'derived'), '0_filled')
+        resp_master_secret=hkdf(master_secret, TH2, 'resp_app_data')
+        init_master_secret=hkdf(master_secret, TH2, 'init_app_data')
+        encrypt_key=hkdf(resp_master_secret, version, 'key')
+        decrypt_key=hkdf(init_master_secret, version, 'key')
+
+        // Commit Transcript for Initiator does not have the resp mesage
+        commit_transcript=messageTranscript + <'Finish', message_inp> + <'Finish_Rsp', 'NULL'>
+    in
+    [ KeyExchangeResp(~sid, ~tidR, ~oidI, ~oidR, somepkI, digest_init, version, VCATrancript,<'Finish_Rsp', 'NULL'>+ <'Finish','NULL'>+messageTranscript, 'NULL', handshake_secret, resp_finished_key, init_finished_key, bindSid, 'ACK_CERTIFICATE') 
+    , !Cert(~oidR, pk(~ltkR), certR)
+    , In(message_inp)
+    , Fr(~kuid) ]
+  --[ Version(~tidR, version),
+      CurrentThreadR(~tidR, ~oidI, ~oidR),
+      SessionId(~tidR, ~sid, bindSid),
+      StartAppData(~sid, bindSid),
+      RespFinishMutualAuth1(~sid, ~tidR, ~oidI, ~oidR),
+      KETranscriptR(<'Finish_Rsp', 'NULL'>+ <'Finish','NULL'>+messageTranscript),
+      SesssionMajorSecretResp(~sid, ~tidR, ~oidI, ~oidR, ~ltkR, handshake_secret),
+      SesssionMajorSecretRespAuth(~sid, ~tidR, ~oidI, ~oidR, somepkI, handshake_secret),
+      RunningMutAuth(~sid, ~tidR, pk(~ltkR), somepkI, handshake_secret, TH2, 'Resp'),
+      CommitMutAuth(~sid, ~tidR, pk(~ltkR), somepkI, handshake_secret, commit_transcript, 'Resp'),
+      KeyUpdate(~tidR, ~sid, ~kuid),
+      Eq(verify(init_signature,h(K2_Transcript_sign),somepkI),true),
+      Eq(init_finished_key, in_finished_key),
+      Eq(K1_Transcript_HMAC,K2_Transcript_HMAC),
+      Eq(K1_Transcript_sign,K2_Transcript_sign)
+  ]->
+    [ //AppData(~tidR, ~sid, ~oidI, ~oidR, bindSid, ~kuid, version, 'NULL', 'NULL', 'Resp', 'Session')
+     //AppData(~tidR, ~sid, ~oidI, ~oidR, bindSid, ~kuid, version, 'NULL', 'NULL', 'Resp', 'Session')
+     !AppDataKey(~kuid, ~tidR, ~sid, ~oidI, ~oidR, bindSid, version, resp_master_secret, init_master_secret, encrypt_key, decrypt_key, 'Resp')
+    , Out(message_out) ]
+
+/* Initiator receives the Finish_Response.
+  1. Compute the transcript and verify the HMAC received.
+  2. Compute and store the session secrets.
+  3. Create the Initiator session state.  AppDataInt
+
+*/
+rule I_FinishMutualAuth_ProcessAndVerify[color=43AA8B]:
+    let
+      message_in =<'Finish_Rsp', version, hmac(h(K1_Transcript_HMAC), in_finished_key)>
+
+      //transcript for response HMAC
+      messageTranscript_RespHMAC=messageTranscript + <'Finish_Rsp', <'Finish_Rsp', version, 'NULL'>>
+      K2_Transcript_HMAC=<VCATranscript, digestR, messageTranscript_RespHMAC, h(certI)>
+
+      // create session with new secrets
+      TH2= messageTranscript + <'Finish_Rsp', message_in>
+      master_secret=hmac(hkdf(handshake_secret, version, 'derived'), '0_filled')
+      resp_master_secret=hkdf(master_secret, TH2, 'resp_app_data')
+      init_master_secret=hkdf(master_secret, TH2, 'init_app_data')
+      decrypt_key=hkdf(resp_master_secret, version, 'key')
+      encrypt_key=hkdf(init_master_secret, version, 'key')
+    
+    in
+    [ KeyExchangeInit(~sid, ~tid, ~oidI, ~oidR, somepkR, digestR, version, VCATranscript,<'Finish_Rsp', 'NULL'>+messageTranscript, ~privKey, ~initSessionId, handshake_secret, init_finished_key, resp_finished_key, bindSid, 'PROCESS_FINISH_REQUEST_AUTH')  
+    , !Cert(~oidI, pk(~ltkI), certI)
+    , In(message_in)
+    , Fr(~kuid)
+    ]
+  --[  Version(~tid, version),
+       CurrentThreadI(~tid, ~oidI, ~oidR),
+       SessionId(~tid, ~sid, bindSid),
+       InitFinishMutualAuth(~sid, ~tid, ~oidI, ~oidR),
+       //StartAppData(~cid, bindSid),
+       SesssionMajorSecretInit(~sid, ~tid, ~oidI, ~oidR, somepkR, handshake_secret),
+       CommitMutAuth(~sid, ~tid, pk(~ltkI), somepkR, handshake_secret, TH2, 'Init'),
+       KeyUpdate(~tid, ~sid, ~kuid),
+       Eq(in_finished_key, resp_finished_key),
+       Eq(K1_Transcript_HMAC,K2_Transcript_HMAC)
+       ]->
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, init_master_secret, resp_master_secret, encrypt_key, decrypt_key, 'Init')
+     ]
+
+
+
+/*****************************************
+*
+* APPLICATION DATA TRANSFER
+*
+*****************************************/
+
+rule Send_Message[color=e9cbff]:
+    let
+      cipher= senc(~payload, encrypt_key)
+    
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, encrypt_key, decrypt_key, role)
+    , Fr(~payload)
+     ]
+  --[ 
+       SessionId(~tid, ~sid, bindSid),
+       CurrentSesion(~tid, ~sid),
+       SendMessage(~sid, ~tid, ~oidI, ~oidR, bindSid, cipher),
+       CurrentKey(~tid, ~sid, ~kuid),
+       Version(~tid, version)
+       ]->
+    [ Out(cipher) ]
+
+rule Receive_Message[color=e9cbff]:
+    let
+      cipher= senc(payload, decrypt_key)
+    
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, encrypt_key, decrypt_key, role)
+    , In(cipher)
+    ]
+  --[  
+       SessionId(~tid, ~sid, bindSid),
+       CurrentSesion(~tid, ~sid),
+       ReceiveMessage(~sid, ~tid, ~oidI, ~oidR, bindSid, cipher),
+       CurrentKey(~tid, ~sid, ~kuid),
+       Version(~tid, version)
+       ]->
+    [ ]
+
+/*****************************************
+*
+* KEY UPDATE
+*
+*****************************************/
+
+/*********************
+*
+* KEY_UPDATE Verify INIT key
+*
+**********************/
+
+/*
+Initiator received ACK of Key_update Request.
+1. Deletes old master secret, derived new encryption key and updates its state.
+2. Sends a Key_update Verify Key request, encrypted using the new secrets
+*/
+
+rule I_KeyUpdateVerify_RequestInitKey[color=e9cbff]:
+    let
+      new_own_master=hkdf(own_master_secret, version, 'binstr')
+      new_enc_key= hkdf(new_own_master, version, 'key')
+      outcipher=senc(<'Key_Update', version, 'VerifyNewKey'>, new_enc_key)
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, enc_key, dec_key, 'Init') //this will be depricated now
+    , Fr(~newkuid)
+    ]
+  --[  
+       SessionId(~tid, ~sid, bindSid)
+      , CurrentSesion(~tid, ~sid)
+      , Version(~tid, version)
+      , CurrentKey(~tid, ~sid, ~kuid)
+      , KeyUpdate(~tid, ~sid, ~newkuid)
+      , InitKeyUpdate(~tid, ~sid, ~kuid, new_own_master)
+      , OnlyOnce(~tid, ~sid, ~kuid)
+       ]->
+    [ !AppDataKey(~newkuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, new_own_master, partner_master_secret, new_enc_key, dec_key, 'Init') //new secrets of the session
+    , Out(outcipher)
+    ]
+
+//Responder received Key_Update verify new key request.
+rule R_KeyUpdateVerify_ResponseInitKey[color=e9cbff]:
+    let
+      new_partner_master=hkdf(partner_master_secret, version, 'binstr')
+      new_dec_key=hkdf(new_partner_master, version, 'key')
+      incipher= senc(<'Key_Update', version, 'VerifyNewKey'>, new_dec_key)
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, enc_key, dec_key, 'Resp')
+    , In(incipher)
+    , Fr(~newkuid)
+    ]
+  --[  
+       SessionId(~tid, ~sid, bindSid)
+      , CurrentSesion(~tid, ~sid)
+      , Version(~tid, version)
+      , CurrentKey(~tid, ~sid, ~kuid)
+      , KeyUpdate(~tid, ~sid, ~newkuid)
+      , RespKeyUpdate(~tid, ~sid, ~kuid, new_partner_master)
+      , RKEyUpdateVerif(~sid, ~tid, ~kuid)
+       ]->
+    [ !AppDataKey(~newkuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, new_partner_master, enc_key, new_dec_key, 'Resp')
+    ]
+
+/*********************
+*
+* KEY_UPDATE Verify ALL keys
+*
+**********************/
+rule I_KeyUpdateVerify_RequestAllKey[color=e9cbff]:
+    let
+      new_own_master=hkdf(own_master_secret, version, 'binstr')
+      new_partner_master=hkdf(partner_master_secret, version, 'binstr')
+      new_enc_key= hkdf(new_own_master, version, 'key')
+      new_dec_key= hkdf(new_partner_master, version, 'key')
+      outcipher=senc(<'Key_Update', version, 'VerifyAllKey'>, new_enc_key)
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, enc_key, dec_key, 'Init') //this will be depricated now
+    , Fr(~newkuid)
+    ]
+  --[  
+       SessionId(~tid, ~sid, bindSid)
+      , CurrentSesion(~tid, ~sid)
+      , Version(~tid, version)
+      , CurrentKey(~tid, ~sid, ~kuid)
+      , KeyUpdate(~tid, ~sid, ~newkuid)
+      , InitAllKeyUpdate(~tid, ~sid, ~kuid, new_own_master, new_partner_master)
+      , OnlyOnce(~tid, ~sid, ~kuid)
+       ]->
+    [ !AppDataKey(~newkuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, new_own_master, new_partner_master, new_enc_key, new_dec_key, 'Init') //new secrets of the session
+    , Out(outcipher)
+    ]
+
+//Responder received Key_Update verify new key request.
+rule R_KeyUpdateVerify_ResponseAllKey[color=e9cbff]:
+    let
+      new_own_master=hkdf(own_master_secret, version, 'binstr')
+      new_partner_master=hkdf(partner_master_secret, version, 'binstr')
+      new_enc_key= hkdf(new_own_master, version, 'key')
+      new_dec_key= hkdf(new_partner_master, version, 'key')
+      incipher= senc(<'Key_Update', version, 'VerifyAllKey'>, new_dec_key)
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, enc_key, dec_key, 'Resp')
+    , In(incipher)
+    , Fr(~newkuid)
+    ]
+  --[  
+       SessionId(~tid, ~sid, bindSid)
+      , CurrentSesion(~tid, ~sid)
+      , Version(~tid, version)
+      , CurrentKey(~tid, ~sid, ~kuid)
+      , KeyUpdate(~tid, ~sid, ~newkuid)
+      , RespAllKeyUpdate(~tid, ~sid, ~kuid, new_own_master, new_partner_master)
+      , RKEyUpdateVerif(~sid, ~tid, ~kuid)
+       ]->
+    [ !AppDataKey(~newkuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, new_own_master, new_partner_master, new_enc_key, new_dec_key, 'Resp')
+    ]
+
+/*********************
+*
+* KEY_UPDATE Verify Resp keys
+*
+**********************/
+
+//Responder send a message with its new session key 
+rule R_KeyUpdateEncap_ResponseRespKey[color=e9cbff]:
+    let
+      new_own_master=hkdf(own_master_secret, version, 'binstr')
+      new_enc_key= hkdf(new_own_master, version, 'key')
+      outcipher= senc(<'Encap_Key_Update', version, 'VerifyNewKey'>, new_enc_key)
+    
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, enc_key, dec_key, 'Resp')
+    , In(incipher)
+    , Fr(~newkuid)
+    ]
+  --[  
+       SessionId(~tid, ~sid, bindSid)
+      , CurrentSesion(~tid, ~sid)
+      , Version(~tid, version)
+      , CurrentKey(~tid, ~sid, ~kuid)
+      , KeyUpdate(~tid, ~sid, ~newkuid)
+      , RespOwnKeyUpdate(~tid, ~sid, ~kuid, new_own_master)
+      , RKEyUpdateVerif(~sid, ~tid, ~kuid)
+       ]->
+    [ !AppDataKey(~newkuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, new_own_master, partner_master_secret, new_enc_key, dec_key, 'Resp')
+    , Out(outcipher)
+     ]
+
+rule I_KeyUpdateEncapAck_RequestRespKey[color=e9cbff]:
+    let
+      new_partner_master=hkdf(partner_master_secret, version, 'binstr')
+      new_dec_key= hkdf(new_partner_master, version, 'key')
+      incipher= senc(<'Encap_Key_Update', version, 'VerifyNewKey'>, new_enc_key)
+     
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, enc_key, dec_key, 'Init') //this will be depricated now
+    , In(incipher)
+    , Fr(~newkuid)
+    ]
+  --[  
+       SessionId(~tid, ~sid, bindSid)
+      , CurrentSesion(~tid, ~sid)
+      , Version(~tid, version)
+      , CurrentKey(~tid, ~sid, ~kuid)
+      , KeyUpdate(~tid, ~sid, ~newkuid)
+      , InitPartnerKeyUpdate(~tid, ~sid, ~kuid, new_partner_master)
+      , OnlyOnce(~tid, ~sid, ~kuid)
+       ]->
+    [ !AppDataKey(~newkuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, new_partner_master, enc_key, new_dec_key, 'Init') //new secrets of the session
+    ]
+
+/***************************************
+*
+* SESSION END
+*
+****************************************/
+
+rule I_SessionEnd_Request[color=e9cbff]:
+    let
+      cipher= senc('END_SESSION', encrypt_key)
+    
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, encrypt_key, decrypt_key, 'Init')
+    , Fr(~payload)
+     ]
+  --[ 
+       SessionId(~tid, ~sid, bindSid),
+       CurrentSesion(~tid, ~sid),
+       StartEndSession(~sid, ~tid, ~oidI, ~oidR),
+       CurrentKey(~tid, ~sid, ~kuid),
+       Version(~tid, version)
+       ]->
+    [ Out(cipher) ]
+
+rule R_SessionEndAck_Response[color=e9cbff]:
+    let
+      incipher= senc('END_SESSION', decrypt_key)
+      outcipher= senc('END_SESSION_ACK', encrypt_key)
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, encrypt_key, decrypt_key, 'Resp')
+    , In(cipher)
+    ]
+  --[  
+       SessionId(~tid, ~sid, bindSid),
+       CurrentSesion(~tid, ~sid),
+       RespEndSession(~sid, ~tid, ~oidI, ~oidR),
+       CurrentKey(~tid, ~sid, ~kuid),
+       Version(~tid, version)
+       ]->
+    [ Out(outcipher)]
+
+rule I_SessionEndAck_Process[color=e9cbff]:
+    let
+      cipher= senc('END_SESSION_ACK', decrypt_key)
+    
+    in
+    [ !AppDataKey(~kuid, ~tid, ~sid, ~oidI, ~oidR, bindSid, version, own_master_secret, partner_master_secret, encrypt_key, decrypt_key, 'Init')
+    , Fr(~payload)
+     ]
+  --[ 
+       SessionId(~tid, ~sid, bindSid),
+       CurrentSesion(~tid, ~sid),
+       InitEndSession(~sid, ~tid, ~oidI, ~oidR),
+       CurrentKey(~tid, ~sid, ~kuid),
+       Version(~tid, version)
+       ]->
+    [  ]
+
+/*****************************************
+*
+* Source Lemmas
+*
+*****************************************/
+
+
+lemma versiontypes[heuristic=S, sources]:
+"
+All tid version #i. Version(tid, version)@#i ==>  (Ex #j. KU(version)@j & j<i) 
+"
+
+
+/*****************************************
+*
+* Loop breakers
+*
+*****************************************/
+lemma IVCATranscriptType[use_induction,reuse]:
+"
+All trans #i.
+VCATranscriptI(trans)@i
+==>
+Ex gv v gc c ga a. 
+trans = <'Get_Version',gv>
+                    + <'Version',v>
+                    + <'Get_Capabilities',gc>
+                    + <'Capabilities',c>
+                    + <'Negotiate_Algorithms',ga>
+                    + <'Algorithms',a> 
+"
+
+lemma RVCATranscriptType[use_induction,reuse, heuristic=S]:
+"
+All trans #i.
+VCATranscriptR(trans)@i
+==>
+Ex gv v gc c ga a. 
+trans = <'Get_Version',gv>
+                    + <'Version',v>
+                    + <'Get_Capabilities',gc>
+                    + <'Capabilities',c>
+                    + <'Negotiate_Algorithms',ga>
+                    + <'Algorithms',a> 
+"
+// KE Transcript type
+lemma IKETranscriptType[use_induction,reuse]:
+"
+All trans #i.
+KETranscriptI(trans)@i
+==>
+Ex gke ker f fr. 
+trans = <'Get_Key_Exchange',gke>
+                    + <'Key_Exchange_Resp',ker>
+                    + <'Finish',f>
+                    + <'Finish_Rsp', fr>
+"
+
+lemma RKETranscriptType[use_induction,reuse, heuristic=S]:
+"
+All trans #i.
+KETranscriptR(trans)@i
+==>
+Ex gke ker f fr. 
+trans = <'Get_Key_Exchange',gke>
+                    + <'Key_Exchange_Resp',ker>
+                    + <'Finish',f>
+                    + <'Finish_Rsp', fr>
+"
+
+lemma UniqueThreadsInit[reuse, heuristic=S, use_induction]:
+"
+All tid oidI oidR oidI2 oidR2 #i #j. CurrentThreadI(tid,oidI,oidR)@i &
+                                     CurrentThreadI(tid,oidI2,oidR2)@j
+                                     ==> oidI=oidI2 & oidR=oidR2  
+"
+
+
+lemma UniqueThreadsResp[reuse, heuristic=S, use_induction]:
+"
+All tid oidI oidI2 oidR oidR2 #i #j. CurrentThreadR(tid,oidI,oidR)@i &
+                          CurrentThreadR(tid,oidI2,oidR2)@j
+                          ==> oidR=oidR2 & oidI=oidI2
+"
+
+
+lemma SecretLtk[reuse, use_induction]:
+"
+ All oid ltk somepk #i. Honest(oid,ltk,somepk)@i ==> not(Ex #j. K(ltk)@j)   
+"
+
+lemma SecretRootkey[reuse, use_induction]:
+"
+ All ltk #i. CreateRootCert(ltk)@i ==> not(Ex #j. K(ltk)@j)   
+"
+
+
+/*****************************************
+*
+* Helper Lemma
+*
+*****************************************/
+
+lemma SingleRespHandshakePerSessionId[reuse,use_induction]:
+" (All sid tidR1 tidR2 oidI1 oidI2 oidR1 oidR2 ltkR1 ltkR2 secret1 secret2 #i #j. 
+    SesssionMajorSecretResp(sid, tidR1, oidI1, oidR1, ltkR1, secret1)@#i &
+    SesssionMajorSecretResp(sid, tidR2, oidI2, oidR2, ltkR2, secret2)@#j 
+    ==> (#i=#j) )
+" 
+
+lemma SingleInitHandshakePerSessionId[reuse,use_induction]:
+"
+// Proved
+(All sid tid1 tid2 oidI1 oidI2 oidR1 oidR2 somepkR1 somepkR2 secret1 secret2 #i #j. 
+    SesssionMajorSecretInit(sid, tid1, oidI1, oidR1, somepkR1, secret1)@#i &
+    SesssionMajorSecretInit(sid, tid2, oidI2, oidR2, somepkR2, secret2)@#j 
+    ==> (#i=#j) )
+" 
+
+// origin of I's certificate, received by R
+lemma ICertOrigin[reuse, use_induction]:
+"
+All tidR oidI oidR pkI certI #i.
+                    RStoredCert(tidR, oidI, oidR, pkI, certI)@#i
+                    ==>
+                    (Ex someoidI ltk #j. j<i & Honest(someoidI,ltk, pkI)@j)
+                    |
+                    (Ex someoidI ltk #j. j<i & Attacker(someoidI,ltk,pkI)@j)
+                    |
+                    not(Ex ltk #j. K(ltk)[-]@j & pkI=pk(ltk))
+" 
+
+// origin of some R's certificate, received by I
+lemma RCertOrigin[reuse, use_induction]:
+"
+All tid oidI oidR pkR certR #i.
+                    IStoredCert(tid, oidI, oidR, pkR, certR)@#i
+                    ==>
+                    (Ex ltk #j. j<i & Honest(oidR,ltk,pkR)@j)
+                    |
+                    (Ex ltk #j. j<i & Attacker(oidR,ltk,pkR)@j)
+                    |
+                    not(Ex ltk #j. K(ltk)@j & pkR=pk(ltk))
+"
+
+
+#ifdef Auth
+
+// AUTOPROVED
+lemma resp_authentication_before_finish[reuse, use_induction]:
+" (All sidI tidI oidI oidR ltkR somepkR #i #j.  
+    CommitBeforeFinish(sidI, tidI, oidI, oidR, somepkR) @j
+    & Honest(oidR, ltkR, somepkR)@i
+    ==> (Ex someoidI sidR tidR #t. RunningBeforeFinish(sidR, tidR, someoidI, oidR, somepkR)@t & t<j)
+    )
+"
+
+// AUTOPROVED 
+lemma resp_authentication_at_finish[use_induction]:
+" (All sid1 tid1 pkI somepk secret someid ltk transcript role #i #j.  
+    Commit(sid1, tid1, pkI, somepk, secret, transcript, role) @j 
+    & Honest(someid, ltk, somepk)@i
+    ==> (Ex sid2 tid2 role2 #t. Running(sid2, tid2, somepk, secret, transcript,role2)@t & t<j)
+  )
+"
+
+// AUTOPROVED
+/* If one party commits to a partner with a secret and transcript, 
+   then there exists some other party also commiting to same secret and transcript*/
+lemma mutual_authentication_weak[use_induction]:
+" (All sid1 tid1 pk1 somepk secret someid ltk transcript role #i #j.  
+    CommitMutAuth(sid1, tid1, pk1, somepk, secret, transcript, role) @j 
+    & Honest(someid, ltk, somepk)@i
+    ==> (Ex sid2 tid2 partnerpk role2 #t. t<j &
+        RunningMutAuth(sid2, tid2, somepk, partnerpk, secret, transcript,role2)@t)
+  )
+"
+
+// AUTOPROVED (captures TLS attack)
+/* If party A (pk1) commits to a partner B (somepk) with a secret and transcript
+   then there is a B that is also talking to A (pk1) and agrees on secret and transcript */
+lemma mutual_authentication_TLS[use_induction]:
+" (All sid1 tid1 pk1 somepk secret someid ltk transcript role #i #j.  
+    CommitMutAuth(sid1, tid1, pk1, somepk, secret, transcript, role) @j 
+    & Honest(someid, ltk, somepk)@i
+    ==> (Ex sid2 tid2 role2 #t. t<j &
+        RunningMutAuth(sid2, tid2, somepk, pk1, secret, transcript,role2)@t )
+  )
+"
+
+// AUTOPROVED  (reflection attack)
+/* If party A (pk1) commits to a partner B (somepk) with a secret and transcript
+   then there is a B that is also talking to A (pk1) and agrees on secret and transcript 
+   AND their roles are different: Init<->Resp*/
+lemma mutual_authentication[use_induction]:
+" (All sid1 tid1 pk1 somepk secret someid ltk transcript role #i #j.  
+    CommitMutAuth(sid1, tid1, pk1, somepk, secret, transcript, role) @j 
+    & Honest(someid, ltk, somepk)@i
+    ==> (Ex sid2 tid2 role2 #t. t<j & not(role=role2) &
+        RunningMutAuth(sid2, tid2, somepk, pk1, secret, transcript,role2)@t )
+  )
+"
+
+#endif 
+
+
+#ifdef Secrecy
+lemma secret_major_init_side[use_induction]:
+" (All sid tid oidI oidR somepkR secret someid ltk #i #j.  
+    SesssionMajorSecretInit(sid, tid, oidI, oidR, somepkR, secret)@#i 
+    & Honest(someid, ltk, somepkR)@j
+    ==> not(Ex #t. K(secret)[+]@t)
+  )
+"
+
+lemma secret_major_resp_side[use_induction]:
+" (All sid tidR oidI oidR somepkI secret someid ltk #i #j.  
+    SesssionMajorSecretRespAuth(sid, tidR, oidI, oidR, somepkI, secret)@#i 
+    & Honest(someid, ltk, somepkI)@j
+    ==> not(Ex #t. K(secret)[+]@t)
+  )
+"
+
+// AUTOPROVED
+lemma receiver_finish_without_init[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex sid2 tid2 oid oidR s2 #j #j2 #j3.
+   RespReachVCA(tid2,oid,oidR)@#j
+  & SendKEResponse(sid2,tid2,oid, oidR, s2)@#j2
+  & RespFinish(sid2,tid2,oid,oidR) @#j3
+  & j<j2 & j2<j3
+  & not(Ex tid oid oidR #t. InitReachVCA(tid,oid,oidR)@t)
+  & not(Ex sidI tid oid oidR #t. StartFinishKE(sidI,tid,oid,oidR)@t) 
+  & not(Ex sidI tid oid oidR #t. SendEncapsulatedDigest(sidI,tid,oid,oidR)@t) 
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. StartFinishKE(sid1,tid1,oid1,oidR1)@#x & StartFinishKE(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+"
+#endif 
+
+/*****************************************
+*
+* Sanity Lemma
+*
+*****************************************/
+
+#ifdef Sanity
+
+// Reachability of the END VCA INIT
+lemma can_reach_VCA_init[heuristic=S]: exists-trace
+  "Ex tid oidI oidR #i.
+  InitReachVCA(tid,oidI,oidR) @ i"
+
+// Reachability of END VCA RESP
+lemma can_reach_VCA_resp[heuristic=S]: exists-trace
+  "Ex tid oidI oidR #i.
+  RespReachVCA(tid,oidI,oidR)@#i"
+
+//INIT: Reachability of Request KE
+lemma can_reach_ke_req_init[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex sid tid oid oidR s1 #i #i2 .
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & i<i2 
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+ "
+
+
+//RESP: Reachability of Response KE
+lemma can_reach_ke_resp[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex sid tid oidI oidR s2 #i #i2 .
+  RespReachVCA(tid,oidI,oidR)@#i
+  & SendKEResponse(sid,tid,oidI,oidR, s2)@#i2
+  & i<i2 
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+ "
+
+//RESP: Reachability of Finish Response KE 
+lemma can_reach_fin_resp[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid sid2 tid tid2 oid oidR s1 s2 #i #i2 #i3 #i4 #j #j2 #j3.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & StartFinishKE(sid,tid, oid, oidR)@i4
+  & RespReachVCA(tid2,oid,oidR)@#j
+  & SendKEResponse(sid2,tid2,oid,oidR, s2)@#j2
+  & RespFinish(sid2,tid2,oid,oidR) @#j3
+  & i<i2 & i2<i3 & i3<i4 & j<j2 & j2<j3
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. StartFinishKE(sid1,tid1,oid1,oidR1)@#x & StartFinishKE(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RespFinish(sid1,tid1,oid1,oidR1)@#x & RespFinish(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+ "
+/*  // STORED PROOFS
+ //INIT: Reachability of Request Finish Without MutualAuth  
+lemma can_reach_fin_req_init[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid tid oid oidR s1 #i #i2 #i3 #i4.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & StartFinishKE(sid,tid, oid, oidR)@i4
+  & i<i2 & i2<i3 & i3<i4
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+ "
+*/
+/*  // STORED PROOFS
+
+ //INIT: Reachability of Response KE 
+lemma can_reach_ke_rec_init[heuristic=S, hide_lemma=RespOptionLoopBreaker, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid tid oid oidR s1 #i #i2 #i3.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & i<i2 & i2<i3
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+"
+
+//INIT: Reachability of Process Finish Without MutualAuth  
+lemma can_reach_fin_rec_init[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid tid oid oidR s1 #i #i2 #i3 #i4 #i5.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & StartFinishKE(sid,tid, oid, oidR)@i4
+  & ReceiveFinish(sid,tid, oid, oidR)@i5
+  & i<i2 & i2<i3 & i3<i4 & i4<i5
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. StartFinishKE(sid1,tid1,oid1,oidR1)@#x & StartFinishKE(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveFinish(sid1,tid1,oid1,oidR1)@#x & ReceiveFinish(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+ "
+
+//INIT: Reachability of Send Digest Encapsulated 
+lemma can_reach_encap_digest_init[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid tid oid oidR s1 #i #i2 #i3 #i6.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & SendEncapsulatedDigest(sid,tid, oid, oidR)@i6
+  & i<i2 & i2<i3 & i3<i6
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. SendEncapsulatedDigest(sid1,tid1,oid1,oidR1)@#x & SendEncapsulatedDigest(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+"
+
+//RESP: Reachability of Receive Encapsulated Digest
+lemma can_reach_encap_digest_resp[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid sid2 tid tid2 oid oidR s1 s2 #i #i2 #i3 #j #j2 #j3.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & RespReachVCA(tid2,oid,oidR)@#j
+  & SendKEResponse(sid2,tid2,oid,oidR, s2)@#j2
+  & ReceivedEncapsulatedDigest(sid2,tid2,oid, oidR) @#j3
+  & i<i2 & i2<i3 & j<j2 & j2<j3 
+  & not(Ex ltk pk1 #t. Attacker(oid,ltk,pk1)@t)
+  & not(Ex #t. StartFinishKE(sid,tid, oid, oidR)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceivedEncapsulatedDigest(sid1,tid1,oid1,oidR1)@#x & ReceivedEncapsulatedDigest(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+ "
+
+ //INIT: Reachability of Send Digest Encapsulated 
+lemma can_reach_encap_cert_init[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid tid oid oidR s1 #i #i2 #i3 #i6 #i7.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & SendEncapsulatedDigest(sid,tid, oid, oidR)@i6
+  & SendEncapsulatedCertificate(sid,tid, oid, oidR)@i7
+  & i<i2 & i2<i3 & i3<i6 & i6<i7
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. SendEncapsulatedDigest(sid1,tid1,oid1,oidR1)@#x & SendEncapsulatedDigest(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+"
+*/
+
+//RESP: Reachability of Receive Encapsulated Digest
+lemma can_reach_encap_cert_resp[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex sid sid2 tid tid2 oid oidR s1 s2 #i #i2 #i3 #j #j2 #j3 #j4.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & RespReachVCA(tid2,oid,oidR)@#j
+  & SendKEResponse(sid2,tid2,oid,oidR, s2)@#j2
+  & ReceivedEncapsulatedDigest(sid2,tid2,oid,oidR) @#j3
+  & ReceiveInitCertificate(sid2,tid2,oid,oidR) @#j4
+  & i<i2 & i2<i3 & j<j2 & j2<j3 
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & not(Ex #t. StartFinishKE(sid,tid, oid, oidR)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceivedEncapsulatedDigest(sid1,tid1,oid1,oidR1)@#x & ReceivedEncapsulatedDigest(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveInitCertificate(sid1,tid1,oid1,oidR1)@#x & ReceiveInitCertificate(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+ "
+
+ //INIT: Reachability of request finish MutualAuth
+lemma can_reach_encap_ack_init[heuristic=C,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex sid tid oid oidR s1 #i #i2 #i3 #i6 #i7 #i8.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & SendEncapsulatedDigest(sid,tid, oid, oidR)@i6
+  & SendEncapsulatedCertificate(sid,tid, oid, oidR)@i7
+  & StartFinishKEMutualAuth(sid,tid, oid, oidR)@i8
+  & i<i2 & i2<i3 & i3<i6 & i6<i7 & i7<i8
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. SendEncapsulatedDigest(sid1,tid1,oid1,oidR1)@#x & SendEncapsulatedDigest(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. SendEncapsulatedCertificate(sid1,tid1,oid1,oidR1)@#x & SendEncapsulatedCertificate(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+"
+
+//RESP: Reachability of end Mutual Authentication
+lemma can_reach_end_mutualAuth_resp[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid sid2 tid tid2 oid oidR s1 s2 #i #i2 #i3 #j #j2 #j3 #j4 #j5.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & RespReachVCA(tid2,oid,oidR)@#j
+  & SendKEResponse(sid2,tid2,oid,oidR, s2)@#j2
+  & ReceivedEncapsulatedDigest(sid2,tid2,oid,oidR) @#j3
+  & ReceiveInitCertificate(sid2,tid2,oid,oidR) @#j4
+  & RespFinishMutualAuth1(sid2,tid2,oid,oidR) @#j5
+  & i<i2 & i2<i3 & j<j2 & j2<j3 & j3<j4 & j4<j5
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. StartFinishKE(sid1,tid1,oid1,oidR1)@#x & StartFinishKE(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceivedEncapsulatedDigest(sid1,tid1,oid1,oidR1)@#x & ReceivedEncapsulatedDigest(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveInitCertificate(sid1,tid1,oid1,oidR1)@#x & ReceiveInitCertificate(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. SendEncapsulatedCertificate(sid1,tid1,oid1,oidR1)@#x & SendEncapsulatedCertificate(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+"
+
+ //INIT: Reachability of request finish MutualAuth
+lemma can_reach_end_mutualAuth_init[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid tid oid oidR s1 #i #i2 #i3 #i6 #i7 #i8 #i9.
+  InitReachVCA(tid,oid,oidR)@#i
+  & StartKeyExchange(sid,tid, oid, oidR, s1)@#i2
+  & ReceiveKeyExchange(sid,tid, oid, oidR)@i3
+  & SendEncapsulatedDigest(sid,tid, oid, oidR)@i6
+  & SendEncapsulatedCertificate(sid,tid, oid, oidR)@i7
+  & StartFinishKEMutualAuth(sid,tid, oid, oidR)@i8
+  & InitFinishMutualAuth(sid,tid, oid, oidR)@i9
+  & i<i2 & i2<i3 & i3<i6 & i6<i7 & i7<i8 & i8<i9
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. SendEncapsulatedDigest(sid1,tid1,oid1,oidR1)@#x & SendEncapsulatedDigest(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. SendEncapsulatedCertificate(sid1,tid1,oid1,oidR1)@#x & SendEncapsulatedCertificate(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+ "
+
+ //RESP: Reachability of end Mutual Authentication with OLD CERT
+ /* Stored proof
+lemma can_reach_end_mutualAuth_resp_oldcert[heuristic=s, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid tid oid oidR #i.
+    RBeforeAuthOldCert(sid,tid,oid,oidR) @ i
+  & not(Ex someoid ltk #t. Attacker(someoid,ltk)@t) 
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceivedEncapsulatedDigest(sid1,tid1,oid1,oidR1)@#x & ReceivedEncapsulatedDigest(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveInitCertificate(sid1,tid1,oid1,oidR1)@#x & ReceiveInitCertificate(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  //& (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. SendEncapsulatedCertificate(sid1,tid1,oid1,oidR1)@#x & SendEncapsulatedCertificate(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  //& (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RBeforeAuthOldCert(sid1,tid1,oid1,oidR1)@#x & RBeforeAuthOldCert(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+" 
+
+lemma can_reach_end_mutualAuth_init_oldcert[heuristic=s, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid tid oid oidR #i.
+    IBeforeAuthOldCert(sid,tid,oid,oidR) @ i
+  & not(Ex someoid ltk #t. Attacker(someoid,ltk)@t) 
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceivedEncapsulatedDigest(sid1,tid1,oid1,oidR1)@#x & ReceivedEncapsulatedDigest(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveInitCertificate(sid1,tid1,oid1,oidR1)@#x & ReceiveInitCertificate(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. SendEncapsulatedCertificate(sid1,tid1,oid1,oidR1)@#x & SendEncapsulatedCertificate(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  //& (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RBeforeAuthOldCert(sid1,tid1,oid1,oidR1)@#x & RBeforeAuthOldCert(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+" */
+
+//SEND MESSAGE
+lemma can_send_receive_message[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex sid1 sid2 tid1 tid2 oid oidR bindsid cipher #i #j .
+    SendMessage(sid1,tid1,oid,oidR, bindsid, cipher)@i
+  & ReceiveMessage(sid2,tid2,oid,oidR, bindsid,cipher)@j
+  & i<j 
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. InitFinishMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. StartFinishKEMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. InitKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. RespKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. InitPartnerKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. RespOwnKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 key2 #t. InitAllKeyUpdate(sid1,tid1,kuid1,key1,key2)@t)
+  & not(Ex sid1 tid1 kuid1 key1 key2 #t. RespAllKeyUpdate(sid1,tid1,kuid1,key1,key2)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. StartFinishKE(sid1,tid1,oid1,oidR1)@#x & StartFinishKE(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveFinish(sid1,tid1,oid1,oidR1)@#x & ReceiveFinish(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. ReceiveMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & ReceiveMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. SendMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & SendMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@#x & RespFinishMutualAuth1(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+"
+
+
+//Key Update Verify Init
+lemma can_keyupdate_init[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex tid tid2 sid sid2 kuid kuid2 key #i #j .
+    InitKeyUpdate(tid, sid, kuid, key)@i
+  & RespKeyUpdate(tid2, sid2, kuid2, key)@j
+  & i<j 
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. InitFinishMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. StartFinishKEMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid oidR bindsid cipher #t. SendMessage(sid1,tid1,oid,oidR, bindsid, cipher)@t)
+  & not(Ex sid1 tid1 oid oidR bindsid cipher #t. ReceiveMessage(sid1,tid1,oid,oidR, bindsid, cipher)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. InitPartnerKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. RespOwnKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 key2 #t. InitAllKeyUpdate(sid1,tid1,kuid1,key1,key2)@t)
+  & not(Ex sid1 tid1 kuid1 key1 key2 #t. RespAllKeyUpdate(sid1,tid1,kuid1,key1,key2)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. StartFinishKE(sid1,tid1,oid1,oidR1)@#x & StartFinishKE(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveFinish(sid1,tid1,oid1,oidR1)@#x & ReceiveFinish(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. ReceiveMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & ReceiveMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. SendMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & SendMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@#x & RespFinishMutualAuth1(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 sid1 sid2 kuid1 kuid2 #x #y. RKEyUpdateVerif(tid1,sid1,kuid1)@#x & RKEyUpdateVerif(tid2,sid2,kuid2)@#y ==> #x=#y)
+  & (All tid1 tid2 sid1 sid2 kuid1 kuid2 k1 k2 #x #y. InitKeyUpdate(tid1,sid1,kuid1,k1)@#x & InitKeyUpdate(tid2,sid2,kuid2, k2)@#y ==> #x=#y)
+"
+
+//Key Update Verify Resp
+lemma can_keyupdate_resp[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex tid tid2 sid sid2 kuid kuid2 key #i #j .
+    RespOwnKeyUpdate(tid, sid, kuid, key)@i
+  & InitPartnerKeyUpdate(tid2, sid2, kuid2, key)@j
+  & i<j 
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. InitFinishMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. StartFinishKEMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid oidR bindsid cipher #t. SendMessage(sid1,tid1,oid,oidR, bindsid, cipher)@t)
+  & not(Ex sid1 tid1 oid oidR bindsid cipher #t. ReceiveMessage(sid1,tid1,oid,oidR, bindsid, cipher)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. InitKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. RespKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 key2 #t. InitAllKeyUpdate(sid1,tid1,kuid1,key1,key2)@t)
+  & not(Ex sid1 tid1 kuid1 key1 key2 #t. RespAllKeyUpdate(sid1,tid1,kuid1,key1,key2)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. StartFinishKE(sid1,tid1,oid1,oidR1)@#x & StartFinishKE(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveFinish(sid1,tid1,oid1,oidR1)@#x & ReceiveFinish(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. ReceiveMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & ReceiveMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. SendMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & SendMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@#x & RespFinishMutualAuth1(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 sid1 sid2 kuid1 kuid2 #x #y. RKEyUpdateVerif(tid1,sid1,kuid1)@#x & RKEyUpdateVerif(tid2,sid2,kuid2)@#y ==> #x=#y)
+  & (All tid1 tid2 sid1 sid2 kuid1 kuid2 k1 k2 #x #y. RespOwnKeyUpdate(tid1,sid1,kuid1,k1)@#x & RespOwnKeyUpdate(tid2,sid2,kuid2, k2)@#y ==> #x=#y)
+  & (All tid1 tid2 sid1 sid2 kuid1 kuid2 k1 k2 #x #y. InitPartnerKeyUpdate(tid1,sid1,kuid1,k1)@#x & InitPartnerKeyUpdate(tid2,sid2,kuid2, k2)@#y ==> #x=#y)
+"
+
+//Key Update Verify All
+lemma can_keyupdate_all[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex tid tid2 sid sid2 kuid kuid2 key1 key2 #i #j .
+    InitAllKeyUpdate(tid, sid, kuid, key1,key2)@i
+  & RespAllKeyUpdate(tid2, sid2, kuid2, key2, key1)@j
+  & i<j 
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. InitFinishMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. StartFinishKEMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid oidR bindsid cipher #t. SendMessage(sid1,tid1,oid,oidR, bindsid, cipher)@t)
+  & not(Ex sid1 tid1 oid oidR bindsid cipher #t. ReceiveMessage(sid1,tid1,oid,oidR, bindsid, cipher)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. InitKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. RespKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. RespOwnKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. InitPartnerKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. StartFinishKE(sid1,tid1,oid1,oidR1)@#x & StartFinishKE(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveFinish(sid1,tid1,oid1,oidR1)@#x & ReceiveFinish(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. ReceiveMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & ReceiveMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. SendMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & SendMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@#x & RespFinishMutualAuth1(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 sid1 sid2 kuid1 kuid2 #x #y. RKEyUpdateVerif(tid1,sid1,kuid1)@#x & RKEyUpdateVerif(tid2,sid2,kuid2)@#y ==> #x=#y)
+  & (All tid1 tid2 sid1 sid2 kuid1 kuid2 k1 k2 k3 k4 #x #y. InitAllKeyUpdate(tid1,sid1,kuid1,k1,k3)@#x & InitAllKeyUpdate(tid2,sid2,kuid2,k2,k4)@#y ==> #x=#y)
+  & (All tid1 tid2 sid1 sid2 kuid1 kuid2 k1 k2 k3 k4 #x #y. RespAllKeyUpdate(tid1,sid1,kuid1,k1,k3)@#x & RespAllKeyUpdate(tid2,sid2,kuid2,k2,k4)@#y ==> #x=#y)
+"
+
+//End Session
+lemma can_endsession[heuristic=S, hide_lemma=ICertOrigin, hide_lemma=RCertOrigin]: exists-trace
+  "Ex tid tid2 sid sid2 oidI oidR #i #j #k.
+    StartEndSession(tid, sid, oidI, oidR)@i
+  & RespEndSession(tid2, sid2, oidI, oidR)@j
+  & InitEndSession(tid, sid, oidI, oidR)@k
+  & i<j & j<k
+  & not(Ex someoid ltk pk1 #t. Attacker(someoid,ltk, pk1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. InitFinishMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid1 oidR1 #t. StartFinishKEMutualAuth(sid1,tid1,oid1,oidR1)@t)
+  & not(Ex sid1 tid1 oid oidR bindsid cipher #t. SendMessage(sid1,tid1,oid,oidR, bindsid, cipher)@t)
+  & not(Ex sid1 tid1 oid oidR bindsid cipher #t. ReceiveMessage(sid1,tid1,oid,oidR, bindsid, cipher)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. InitKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. RespKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. RespOwnKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 #t. InitPartnerKeyUpdate(sid1,tid1,kuid1,key1)@t)
+  & not(Ex sid1 tid1 kuid1 key1 key2 #t. InitAllKeyUpdate(sid1,tid1,kuid1,key1,key2)@t)
+  & not(Ex sid1 tid1 kuid1 key1 key2 #t. RespAllKeyUpdate(sid1,tid1,kuid1,key1,key2)@t)
+  & (All tid1 tid2 oidI1 oidI2 oidR1 oidR2 #x #y. RespReachVCA(tid1,oidI1,oidR1)@#x & RespReachVCA(tid2,oidI2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 oid1 oid2 tid1 tid2 oidR1 oidR2 #x #y. RStartKEX(sid1,tid1,oid1,oidR1)@#x & RStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 s1 s2 #x #y. SendKEResponse(sid1,tid1,oid1,oidR1,s1)@#x & SendKEResponse(sid2,tid2,oid2,oidR2,s2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. StartFinishKE(sid1,tid1,oid1,oidR1)@#x & StartFinishKE(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. IStartKEX(sid1,tid1,oid1,oidR1)@#x & IStartKEX(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveKeyExchange(sid1,tid1,oid1,oidR1)@#x & ReceiveKeyExchange(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. ReceiveFinish(sid1,tid1,oid1,oidR1)@#x & ReceiveFinish(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. ReceiveMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & ReceiveMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 b1 b2 c1 c2 #x #y. SendMessage(sid1,tid1,oid1,oidR1,b1,c1)@#x & SendMessage(sid2,tid2,oid2,oidR2,b2,c2)@#y ==> #x=#y)
+  & (All sid1 sid2 tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RespFinishMutualAuth1(sid1,tid1,oid1,oidR1)@#x & RespFinishMutualAuth1(sid2,tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 sid1 sid2 kuid1 kuid2 #x #y. RKEyUpdateVerif(tid1,sid1,kuid1)@#x & RKEyUpdateVerif(tid2,sid2,kuid2)@#y ==> #x=#y)
+  "
+
+#endif
+
+
+end

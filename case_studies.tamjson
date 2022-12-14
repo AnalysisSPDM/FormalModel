@@ -1,0 +1,30 @@
+{
+    "timeout": 1200,
+    "silent": true,
+    "cores": 4,
+    "log": false,
+    "models" : ["device_attestation.spthy",
+                "preshared_pk_auth.spthy",
+                "preshared_pk_fs.spthy"
+                "key_exchange_auth.spthy",
+		            "preshared_psk_refl.spthy",
+                "preshared_psk_auth.spthy"],
+    "device_attestation.spthy" : {
+      "fixed_flags" : ["fast","Sanity"]
+      },
+    "preshared_pk_auth.spthy" : {
+      "fixed_flags" : ["Auth","Sanity"]
+      },
+    "preshared_pk_fs.spthy" : {
+      "fixed_flags" : ["fs"]
+      },
+    "key_exchange_auth.spthy" : {
+      "fixed_flags" : ["Auth","Secrecy","Sanity"]
+      },
+    "preshared_psk_auth.spthy" : {
+      "fixed_flags" : ["Auth","Secrecy","Sanity"]
+      },
+    "preshared_psk_refl.spthy" : {
+      "fixed_flags" : ["Auth","Secrecy","Sanity"]
+      }
+}

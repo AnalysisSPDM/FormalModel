@@ -1,0 +1,1092 @@
+theory initphase
+begin
+
+builtins: signing, multiset, hashing
+
+
+restriction OneChannel:
+"
+All idI idR #i #j. Channel(idI, idR)@#i & Channel(idI, idR)@#j ==> #i=#j   
+"
+
+restriction OneSharedPK:
+"
+All idI idR #i #j. OneSharePK(idI, idR)@#i & OneSharePK(idI, idR)@#j ==> #i=#j   
+"
+
+restriction OneCertificate:
+"
+All id #i #j. OneCert(id)@#i & OneCert(id)@#j ==> #i=#j   
+"
+
+/*Create only one Root Certificate (for simplicity) */
+restriction SingleRootCert:
+"
+All #i #j. RootOnce()@i & RootOnce()@j ==> #i = #j
+"
+
+/*
+Standard equality restrictions
+*/
+restriction equality:
+    "All x y #i. Eq(x, y) @ i ==> x = y"
+
+restriction inequality:
+    "All x y #i. Neq(x, y) @ i ==> not(x = y)"
+
+
+// We for now decided for a single root certificate and no certificate hierarchy
+// This also means that we do not make any difference between DeviceCertificates
+// and AliasCertificates for now
+rule CreateRootCert[color= F9C74F]:
+    [ Fr(~ltk)]
+  --[ CreateRootCert(~ltk), RootOnce() ]->
+    [ !RootCert(~ltk),
+      !TrustAnchor(pk(~ltk)),
+      Out(pk(~ltk)) ] 
+
+
+// Create a Device with a unique ID, supported versions
+// ,supported capabilities and supported algorithms.
+// Capabilities shall be modeled as a multiset and
+// version/algorithms are a tuple and can either be
+// good or bad
+
+rule createDevice:
+    [ Fr(~oid),
+      In(C),
+      Fr(~measure),
+      In(V),
+      In(A)]
+  --[ ]->
+    [ !Device(~oid, V, C, A),
+      !Measurement(~oid, ~measure),
+      Out(~oid) ]
+
+
+rule sharePSK:
+    [ !Device(~oid1,V1,'PSK' + C1,A1), !Device(~oid2,V2,'PSK' + C2,A2), Fr(~key) ]
+  --[  ]->
+    [ !PSK(~oid1,~oid2,~key), !PSK(~oid2, ~oid1, ~key) ]
+
+rule sharePK:
+    [ Fr(~ltk1), Fr(~ltk2), !Device(~oid1,V1,C1,A1), !Device(~oid2,V2,C2,A2) ]
+  --[ OneSharePK(~oid1,~oid2), OneSharePK(~oid2,~oid1), SecretLtk(~ltk1), SecretLtk(~ltk2),
+       Honest(~oid1,~ltk1,pk(~ltk1)) , Honest(~oid2,~ltk2,pk(~ltk2))  ]->
+    [ !SharedPK(~oid1,~oid2,pk(~ltk1),pk(~ltk2)),
+      !LTK(~oid1,~ltk1), !LTK(~oid2,~ltk2), 
+      Out(pk(~ltk1)), Out(pk(~ltk2))  ]
+
+rule getCertHonest:
+  let
+    cert = sign(<~oid, pk(~ltk)>,~rootkey)
+  in
+    [ !Device(~oid,V,C,A), !RootCert(~rootkey), Fr(~ltk) ]
+  --[ OneCert(~oid), Honest(~oid,~ltk,pk(~ltk)) ]->
+    [ !LTK(~oid,~ltk),!PK(~oid,pk(~ltk)), !Cert(~oid, pk(~ltk), cert), Out(<pk(~ltk),cert>) ]
+
+rule getCertAttacker:
+  let
+    cert = sign(<~oid, pk(~ltk)>,~rootkey)
+  in
+    [ In(~oid), !RootCert(~rootkey), Fr(~ltk) ]
+  --[ Attacker(~oid,~ltk,pk(~ltk)) ]->
+    [ !PK(~oid,pk(~ltk)), Out(<~ltk,~oid,cert>) ]
+
+
+
+rule I_Version_FirstRequest[color=2ec4b6]:
+    let 
+      message = <'Get_Version', '1'>
+      VCATranscript = <'Get_Version',message>
+                    + <'Version','NULL'>
+                    + <'Get_Capabilities','NULL'>
+                    + <'Capabilities','NULL'>
+                    + <'Negotiate_Algorithms','NULL'>
+                    + <'Algorithms','NULL'>
+      optionsTranscript = <'Get_Digest','NULL'>
+                    + <'Digest','NULL'>
+                    + <'Get_Certificate','NULL'>
+                    + <'Certificate','NULL'>
+                    + <'Get_Challenge','NULL'>
+                    + <'Challenge','NULL'>
+                    +<'Get_Measurement', 'NULL'>
+    in
+    [ !Device(~oid, V, C, A), !Device(~oidR, VR, CR, AR), Fr(~tid) ]
+  --[ Channel(~oid,~oidR), ThreadI(~tid,~oid,~oidR),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      OptionTranscriptI(optionsTranscript)]->
+    [ StateInit(~tid, ~oid, ~oidR, '1', 'NULL', <V,C,A>, VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETVERSION'),
+      Out(message)
+    ]
+
+
+rule R_Version_FirstResponse[color=2ec4b6]:
+    let 
+      message_inp = <'Get_Version', '1'>
+      message_out = <'Version', V>
+      VCATranscript = <'Get_Version',message_inp>
+                    + <'Version',message_out>
+                    + <'Get_Capabilities','NULL'>
+                    + <'Capabilities','NULL'>
+                    + <'Negotiate_Algorithms','NULL'>
+                    + <'Algorithms','NULL'>
+      optionsTranscript = <'Get_Digest','NULL'>
+                    + <'Digest','NULL'>
+                    + <'Get_Certificate','NULL'>
+                    + <'Certificate','NULL'>
+                    + <'Get_Challenge','NULL'>
+                    + <'Challenge','NULL'>
+                    +<'Get_Measurement', 'NULL'>
+    in
+    [ !Device(~oid, V, C, A), 
+      Fr(~tid),
+      In(message_inp) ]
+  --[ ThreadR(~tid,~oid),
+      CurrentThreadR(~tid,~oid),
+      OptionTranscriptR(optionsTranscript)
+  ]->
+    [ StateResp(~tid, ~oid, '1', 'NULL', <V,C,A>, VCATranscript, optionsTranscript, 'NULL', 'NULL', 'RESP_GETVERSION'),
+      Out(message_out) ]
+
+
+
+
+rule I_Capabilities_Request[color=F9844A]:
+    let
+      message_inp = <'Version', VR>
+      message_out = <'Get_Capabilities', vx, C>
+      VER = <'Version', message_inp>
+      GETCAP = <'Get_Capabilities', message_out>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, '1', 'NULL', <V,C,A>, <'Version',trash1> + <'Get_Capabilities',trash2> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETVERSION'),
+      In(message_inp), In(vx) ]
+  --[ CurrentThreadI(~tid, ~oid, ~oidR),
+      OptionTranscriptI(optionsTranscript)]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, 'NULL', <V,C,A>, VER + GETCAP + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETCAP'),
+      Out(message_out) ]
+
+
+
+rule R_Capabilities_Response[color=F9844A]:
+    let
+      message_inp = <'Get_Capabilities', vx, CI>
+      message_out = <'Capabilities', vx, C>
+      GETCAP = <'Get_Capabilities', message_inp>
+      CAP = <'Capabilities', message_out>
+    in
+    [ StateResp(~tid, ~oid, '1', 'NULL', <V,C,A>, <'Get_Capabilities','NULL'> + <'Capabilities','NULL'> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'RESP_GETVERSION'),
+      In(message_inp) ]
+  --[ 
+      CurrentThreadR(~tid,~oid),
+      OptionTranscriptR(optionsTranscript)
+  ]->
+    [ StateResp(~tid, ~oid, vx, 'NULL', <V,C,A>, GETCAP + CAP + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'RESP_GETCAPABILITIES'),
+      Out(message_out) ]
+
+
+
+rule I_Algorithms_Request[color=F9844A]:
+    let
+      message_inp = <'Capabilities', vx, CR>
+      message_out = <'Negotiate_Algorithms', vx, A>
+      CAP = <'Capabilities', message_inp>
+      NEGALG = <'Negotiate_Algorithms', message_out>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, 'NULL', <V,C,A>, <'Capabilities','NULL'> + <'Negotiate_Algorithms','NULL'> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETCAP'),
+      In(message_inp) ]
+  --[ 
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      OptionTranscriptI(optionsTranscript)]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, 'NULL', <V,C,A>, CAP + NEGALG + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETALGORITHMS'),
+      Out(message_out) ]
+
+
+
+rule R_Algorithms_Response[color=F9844A]:
+    let
+      message_inp = <'Negotiate_Algorithms', vx, AI>
+      message_out = <'Algorithms', vx, ax>
+      NEGALG = <'Negotiate_Algorithms', message_inp>
+      ALG = <'Algorithms', message_out>
+    in
+    [ StateResp(~tid, ~oid, vx, 'NULL', <V,C,A>, <'Negotiate_Algorithms','NULL'> + <'Algorithms','NULL'> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'RESP_GETCAPABILITIES'),
+      In(message_inp), In(ax) ]
+  --[ CurrentThreadR(~tid,~oid),
+      RespReachVCA(~tid,~oid),
+      OptionTranscriptR(optionsTranscript)
+  ]->
+    [ StateResp(~tid, ~oid, vx, ax, <V,C,A>, NEGALG + ALG + VCATranscript, optionsTranscript, 'NULL', 'NULL','IDLE'),
+      Out(message_out) ]
+
+
+
+rule I_Algorithms_ProcessResponse[color=F9844A]:
+    let
+      message_inp = <'Algorithms', vx, ax>
+      ALG = <'Algorithms', message_inp>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, 'NULL', <V,C,A>, <'Algorithms','NULL'> + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'START_GETALGORITHMS'),
+      In(message_inp) ]
+  --[ Version(~tid, vx),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      OptionTranscriptI(optionsTranscript),
+      InitReachVCA(~tid, ~oid, ~oidR) ]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, ALG + VCATranscript, optionsTranscript, 'NULL', 'NULL', 'IDLE')
+     ]
+
+/*****************************************
+*
+* DIGESTS
+*
+*****************************************/
+
+rule I_Digest_Request[color=577590]:
+    let
+    message_out = <'Get_Digest', vx>
+    messageTranscript = <'Get_Digest', message_out>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, <'Get_Digest',getdig> + optionsTranscript, somepkR, digest, 'IDLE')
+    ]
+  --[ Version(~tid, vx),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      RequestDigest(~tid, ~oid, ~oidR),
+      OptionTranscriptI(<'Get_Digest',getdig> + optionsTranscript)]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkR, digest, 'START_DIGEST'),
+      Out(message_out)
+     ]
+
+rule R_Digest_Response[color=577590]:
+    let
+      digest = h(cert)
+      message_inp = <'Get_Digest', vx>
+      message_out= <'Digest', vx, digest>
+      messageTranscript = <'Get_Digest', message_inp> + <'Digest', message_out>
+    in
+    [ StateResp(~tid, ~oid, vx, ax, <V,C,A>, VCATranscript, <'Get_Digest',getdig> + <'Digest',dig> + optionsTranscript, somepkI, 'NULL','IDLE'), 
+      !Cert(~oid, pk(~ltk), cert),
+      In(message_inp) ]
+  --[ Version(~tid, vx),
+      CurrentThreadR(~tid,~oid),
+      OptionTranscriptR(<'Get_Digest',getdig> + <'Digest',dig> + optionsTranscript),
+      SendDigest(~tid, ~oid, digest) ]->
+    [ StateResp(~tid, ~oid, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkI, 'NULL','IDLE'), 
+      Out(message_out) ]
+
+rule I_Digest_ReceiveUnknownDigest[color=577590]:
+    let
+      digest = h(somecert)
+      message_inp= <'Digest', vx, digest>
+      messageTranscript = <'Digest', message_inp>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, <'Digest',dig> + optionsTranscript, somepkR, anyDigest, 'START_DIGEST'),
+      In(message_inp)
+    ]
+  --[ Neq(digest,anyDigest),
+      Version(~tid, vx),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      OptionTranscriptI(<'Digest',dig> + optionsTranscript),
+      ReceiveDigest(~tid, ~oid, ~oidR, digest) ]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkR, digest, 'NEED_TO_START_CERTIFICATE')
+    ]  
+
+// We only allow the rule to be used if we currently do not have a digest in the options transcript
+// aka M1/M2 have been reset.
+rule I_Digest_ReceiveKnownDigest[color=577590]:
+    let
+      digest = h(somecert)
+      message_inp= <'Digest', vx, digest>
+      messageTranscript = <'Digest', message_inp>
+    in
+    [  StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, <'Digest','NULL'> + optionsTranscript, somepkR, digest_stored, 'START_DIGEST'),
+    In(message_inp)
+    ]
+  --[  //VerifiedResponderCert(~tid,~didI,~didR,digest),
+       Eq(digest_stored, digest),
+       Version(~tid, vx),
+       OptionTranscriptI(<'Digest','NULL'> + optionsTranscript),
+       ReceiveDigest(~tid, ~oid, ~oidR, digest),
+       CurrentThreadI(~tid, ~oid, ~oidR),
+       Neq(digest_stored, 'NULL')]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkR, digest_stored, 'IDLE')
+     ]  
+
+
+/*****************************************
+*
+* CERTIFICATE
+*
+*****************************************/
+
+rule I_Certificate_Request[color=4D908E]:
+    let
+    message_out = <'Get_Certificate', vx>
+    messageTranscript = <'Get_Certificate', message_out>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript,  <'Get_Certificate',getcert> + optionsTranscript, somepkR, digest, 'NEED_TO_START_CERTIFICATE')
+    ]
+  --[ Version(~tid, vx),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      RequestCertificate(~tid, ~oid, ~oidR),
+      OptionTranscriptI(<'Get_Certificate',getcert> + optionsTranscript)
+      ]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkR, digest, 'WAIT_FOR_CERTIFICATE'),
+      Out(message_out)
+     ]
+
+
+rule I_Certificate_Request_new[color=4D908E]:
+    let
+    message_out = <'Get_Certificate', vx>
+    messageTranscript = <'Get_Certificate', message_out>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript,  <'Get_Certificate',getcert> + optionsTranscript, somepkR, digest, 'IDLE')
+    ]
+  --[ Version(~tid, vx),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      RequestCertificate(~tid, ~oid, ~oidR),
+      OptionTranscriptI(<'Get_Certificate',getcert> + optionsTranscript)
+      ]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkR, digest, 'WAIT_FOR_CERTIFICATE'),
+      Out(message_out)
+     ]
+
+rule R_Certificate_Response[color=4D908E]:
+    let
+      message_inp = <'Get_Certificate', vx>
+      message_out= <'Certificate', vx, cert>
+      messageTranscript = <'Get_Certificate', message_inp> + <'Certificate', message_out>
+    in
+    [ StateResp(~tid, ~oid, vx, ax, <V,C,A>, VCATranscript, <'Get_Certificate',getcert> + <'Certificate',tcert> + optionsTranscript, somepkI, 'NULL','IDLE'),
+      In(message_inp),
+      //!RootCert(~rootKey),
+      !Cert(~oid, pk(~ltk), cert) ]
+  --[ 
+      Version(~tid, vx),
+      CurrentThreadR(~tid,~oid),
+      OptionTranscriptR(<'Get_Certificate',getcert> + <'Certificate',tcert> + optionsTranscript),
+      SendCertificate(~tid, ~oid, cert)
+  ]->
+    [ StateResp(~tid, ~oid, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkI, 'NULL','IDLE'),
+      Out(message_out) ]
+
+
+rule I_Certificate_ProcessAndVerify[color=4D908E]:
+    let
+    certR = sign(<~oidR, pk(~ltk)>,~rootkey)
+    message_inp = <'Certificate', vx, certR>
+    messageTranscript = <'Certificate', message_inp>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, <'Certificate',tcert> + optionsTranscript, somepkR, digest, 'WAIT_FOR_CERTIFICATE'),
+      !RootCert(~rootkey),
+      In(message_inp)
+    ]
+  --[ 
+      FinishCertificate(~tid, ~oid, ~oidR, pk(~ltk), certR),
+      Version(~tid, vx),
+      ReceivePK(pk(~ltk),~ltk),
+      CertificateKey(~oidR, pk(~ltk),~rootkey),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      OptionTranscriptI(<'Certificate',tcert> + optionsTranscript),
+      ReceiveCertificate(~tid, ~oid, ~oidR, certR),
+      Eq(h(certR),digest)]-> // why this? Isnt it the other way around? TO remove
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, pk(~ltk), digest, 'IDLE')
+     ]
+
+/*****************************************
+*
+* CHALLENGE
+*
+*****************************************/
+
+rule I_Challenge_Request[color=43AA8B]:
+    let
+    message = <'Get_Challenge', vx, ~nonce>
+    messageTranscript = <'Get_Challenge', message>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, <'Get_Challenge',getchal> + optionsTranscript, somepkR, digest, 'IDLE')
+      ,Fr(~nonce)
+    ]
+  --[ Neq(somepkR, 'NULL'),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      OptionTranscriptI(<'Get_Challenge',getchal> + optionsTranscript),
+      RequestChallenge(~tid, ~oid, ~oidR),
+      Version(~tid, vx)
+      ]-> 
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkR, digest, 'START_CHALLENGE'),
+      Out(message)
+     ]
+
+rule R_Challenge_Response[color=43AA8B]:
+    let
+      message_inp = <'Get_Challenge', vx, ~nonce>
+      //transcript to be signed without signature
+      message_without_signature=<'Challenge', vx, 'NULL'>
+      messageTranscript = <'Get_Challenge', message_inp> + <'Challenge', message_without_signature>
+      M1_transcript=<vx, 'Responder_Signing', VCATranscript, messageTranscript+optionsTranscript>
+
+      message_out= <'Challenge', vx, sign(h(M1_transcript),~ltkR)>
+      new_optionsTranscript = <'Get_Digest','NULL'>
+                            + <'Digest','NULL'>
+                            + <'Get_Certificate','NULL'>
+                            + <'Certificate','NULL'>
+                            + <'Get_Challenge','NULL'>
+                            + <'Challenge','NULL'>
+                            + <'Get_Measurement', 'NULL'>
+    in
+    [StateResp(~tid, ~oid, vx, ax, <V,C,A>, VCATranscript,<'Get_Challenge',getchal> + <'Challenge', chal> + optionsTranscript, somepkI, 'NULL','IDLE'),
+     !Cert(~oid, pk(~ltkR), cert),
+     In(message_inp) ]
+  --[ Version(~tid, vx),
+      CurrentThreadR(~tid,~oid),
+      OptionTranscriptR(<'Get_Challenge',getchal> + <'Challenge', chal> + optionsTranscript),
+      SendChallenge(~tid, ~oid, sign(h(M1_transcript),~ltkR)),
+      RunningChallenge(~tid, ~oid, ~ltkR) ]->
+    [ StateResp(~tid, ~oid, vx, ax, <V,C,A>, VCATranscript, new_optionsTranscript, somepkI, 'NULL','IDLE'),
+      Out(message_out) ]
+
+rule I_Challenge_ProcessAndVerify[color=43AA8B]:
+    let
+      message_inp = <'Challenge', vx, sign(h(M1_transcript),ltkR)>
+      signature = sign(h(M1_transcript),ltkR)
+      //transcript without signature
+      message_without_signature=<'Challenge', vx, 'NULL'>
+      messageTranscript =  <'Challenge', message_without_signature>
+      M2_transcript=<vx, 'Responder_Signing', VCATranscript, messageTranscript+optionsTranscript>
+      //certR = verify(signature, M2_transcript, somepkR )
+
+      new_optionsTranscript = <'Get_Digest','NULL'>
+                            + <'Digest','NULL'>
+                            + <'Get_Certificate','NULL'>
+                            + <'Certificate','NULL'>
+                            + <'Get_Challenge','NULL'>
+                            + <'Challenge','NULL'>
+                            + <'Get_Measurement', 'NULL'>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, <'Challenge', chal> + optionsTranscript, somepkR, digest, 'START_CHALLENGE'),
+      In(message_inp), In(vx)
+    ]
+  --[  Eq(verify(signature,h(M1_transcript),somepkR),true),
+       Eq(M1_transcript,M2_transcript),
+       Version(~tid, vx),
+       CurrentThreadI(~tid, ~oid, ~oidR),
+       ReceiveChallenge(~tid, ~oid, signature),
+       SuccessChallenge(~tid, ~oid, ~oidR, somepkR),
+       OptionTranscriptI(<'Challenge', chal> + optionsTranscript),
+       Neq(somepkR,'NULL')
+       ]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, new_optionsTranscript, somepkR, digest, 'IDLE')
+     ]
+
+/*****************************************
+*
+* MEASUREMENTS CERTIFICATE
+*
+*****************************************/
+
+rule I_Measurement_Request[color=43AA8B]:
+    let
+    message_out = <'Get_Measurement', vx, ~nonce>
+    messageTranscript = <'Get_Measurement', message_out>
+    in
+    [  StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, <'Get_Measurement', 'NULL'> + optionsTranscript, somepkR, digest, 'IDLE')
+      , Fr(~nonce)
+    ]
+  --[ Version(~tid, vx),
+      Neq(somepkR, 'NULL'),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      OptionTranscriptI(<'Get_Measurement', 'NULL'> + optionsTranscript),
+      RequestMeasurement(~tid, ~oid, ~oidR),
+      MeasurePk(~tid, ~oid, ~oidR, somepkR) 
+      ]-> 
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkR, digest, 'START_MEASUREMENT'),
+      Out(message_out)
+     ]
+
+
+rule R_Measurement_Response[color=43AA8B]:
+    let
+      message_inp = <'Get_Measurement', vx, ~nonce>
+      message_without_signature=<'Measurement', vx, ~measure, ~respNonce, 'NULL'>
+      messageTranscript = <'Get_Measurement', message_inp> + <'Measurement', message_without_signature>
+      L1_transcript=<vx, 'Measurement_Signing', VCATranscript, messageTranscript>
+      signature=sign(h(L1_transcript),~ltkR)
+      message_out= <'Measurement', vx, ~measure, ~respNonce, sign(h(L1_transcript),~ltkR)>
+      new_optionsTranscript = <'Get_Digest','NULL'>
+                            + <'Digest','NULL'>
+                            + <'Get_Certificate','NULL'>
+                            + <'Certificate','NULL'>
+                            + <'Get_Challenge','NULL'>
+                            + <'Challenge','NULL'>
+                            + <'Get_Measurement', 'NULL'>
+    in
+    [ StateResp(~tid, ~oid, vx, ax, <V,C,A>, VCATranscript, optionsTranscript, somepkI, 'NULL','IDLE'),
+      Fr(~respNonce),
+      !LTK(~oid, ~ltkR),
+      !Measurement(~oid, ~measure),
+      In(message_inp) ]
+  --[ Version(~tid, vx),
+      CurrentThreadR(~tid,~oid),
+      OptionTranscriptR(optionsTranscript),
+      SendMeasurement(~tid, ~oid, ~ltkR, signature) ]->
+    [  StateResp(~tid, ~oid, vx, ax, <V,C,A>, VCATranscript, new_optionsTranscript, somepkI, 'NULL','IDLE'),
+      Out(message_out) ] 
+
+rule I_Measurement_ProcessAndVerify[color=43AA8B]:
+    let
+      message_inp = <'Measurement', vx, measure_R, respNonce, sign(h(L1_transcript),~ltkR)>
+      signature = sign(h(L1_transcript),~ltkR)
+      //transcript without signature
+      message_without_signature=<'Measurement', vx, measure_R, respNonce, 'NULL'>
+      messageTranscript = <'Get_Measurement', measTrancript> + <'Measurement', message_without_signature>
+      L2_transcript=<vx, 'Measurement_Signing', VCATranscript, messageTranscript>
+      new_optionsTranscript = <'Get_Digest','NULL'>
+                            + <'Digest','NULL'>
+                            + <'Get_Certificate','NULL'>
+                            + <'Certificate','NULL'>
+                            + <'Get_Challenge','NULL'>
+                            + <'Challenge','NULL'>
+                            + <'Get_Measurement','NULL'>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript,<'Get_Measurement', measTrancript> + optionsTranscript, somepkR, digest, 'START_MEASUREMENT'),
+      In(message_inp)
+    ]
+  --[  Version(~tid, vx),
+       Reach(),
+       OptionTranscriptI(<'Get_Measurement', measTrancript>+optionsTranscript),
+       MeasurePk(~tid, ~oid, ~oidR, somepkR),
+       ReceiveMeasurement(~tid, ~oid, ~oidR, somepkR, signature),
+       CurrentThreadI(~tid, ~oid, ~oidR),
+       Neq(somepkR,'NULL'),
+       Eq(verify(signature,h(L1_transcript),somepkR),true),
+       Eq(L1_transcript,L2_transcript)
+       ]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, new_optionsTranscript, somepkR, digest, 'IDLE'), 
+     ]   
+
+/*****************************************
+*
+* MEASUREMENTS SHARED PK
+*
+*****************************************/
+
+rule I_MeasurementSharedPK_Request[color=43AA8B]:
+    let
+    message_out = <'Get_Measurement', vx, ~nonce>
+    messageTranscript = <'Get_Measurement', message_out>
+    in
+    [  StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, <'Get_Measurement', 'NULL'> + optionsTranscript, somepkR, digest, 'IDLE')
+      , Fr(~nonce)
+    ]
+  --[ Version(~tid, vx),
+      Eq(somepkR, 'NULL'),
+      RequestMeasurementPK(~tid, ~oid, ~oidR),
+      CurrentThreadI(~tid, ~oid, ~oidR),
+      OptionTranscriptI(<'Get_Measurement', 'NULL'> + optionsTranscript),
+      ]-> 
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, messageTranscript + optionsTranscript, somepkR, digest, 'START_MEASUREMENT_PK'),
+      Out(message_out)
+     ]
+
+
+rule I_MeasurementSharedPK_ProcessAndVerify[color=43AA8B]:
+    let
+      message_inp = <'Measurement', vx, measure_R, respNonce, sign(h(L1_transcript),~ltkR)>
+      signature = sign(h(L1_transcript),~ltkR)
+      //transcript without signature
+      message_without_signature=<'Measurement', vx, measure_R, respNonce, 'NULL'>
+      messageTranscript = <'Get_Measurement', measTrancript>  + <'Measurement', message_without_signature>
+      L2_transcript=<vx, 'Measurement_Signing', VCATranscript, messageTranscript>
+      new_optionsTranscript = <'Get_Digest','NULL'>
+                            + <'Digest','NULL'>
+                            + <'Get_Certificate','NULL'>
+                            + <'Certificate','NULL'>
+                            + <'Get_Challenge','NULL'>
+                            + <'Challenge','NULL'>
+                            + <'Get_Measurement','NULL'>
+    in
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, <'Get_Measurement', measTrancript> + optionsTranscript, somepkR, digest, 'START_MEASUREMENT_PK'),
+      !SharedPK(~oid,~oidR,pkI,pkR),
+      In(message_inp)
+    ]
+  --[  Version(~tid, vx),
+       Reach(),
+       OptionTranscript(<'Get_Measurement', measTrancript>+optionsTranscript),
+       //MeasurePk(~tid, ~oid, ~oidR, pkR),
+       ReceiveMeasurement(~tid, ~oid, ~oidR, pkR, signature),
+       ReceiveMeasurementShared(~tid, ~oid, ~oidR, pkR, signature),
+       CurrentThreadI(~tid, ~oid, ~oidR),
+       Eq(verify(signature,h(L1_transcript),pkR),true),
+       Eq(L1_transcript,L2_transcript)
+       ]->
+    [ StateInit(~tid, ~oid, ~oidR, vx, ax, <V,C,A>, VCATranscript, new_optionsTranscript, somepkR, digest, 'IDLE'), 
+     ] 
+
+
+
+
+
+
+
+
+/*****************************************
+*
+* Source Lemmas
+*
+*****************************************/
+
+
+lemma versiontypes [sources]:
+"
+All tid version #i. Version(tid, version)@#i ==>  (Ex #j. KU(version)@j & j<i) 
+"
+
+
+/*****************************************
+*
+* Loop breakers
+*
+*****************************************/
+lemma IoptionsTranscriptType[use_induction,reuse]:
+"
+All trans #i.
+OptionTranscriptI(trans)@i
+==>
+Ex gd d gc c ch cha gm. 
+trans =   <'Get_Digest',gd>
+        + <'Digest',d>
+        + <'Get_Certificate',gc>
+        + <'Certificate',c>
+        + <'Get_Challenge',ch>
+        + <'Challenge',cha>  
+        + <'Get_Measurement', gm> 
+"
+
+lemma RoptionsTranscriptType[use_induction,reuse, heuristic=S]:
+"
+All trans #i.
+OptionTranscriptR(trans)@i
+==>
+Ex gd d gc c ch cha gm. 
+trans =   <'Get_Digest',gd>
+        + <'Digest',d>
+        + <'Get_Certificate',gc>
+        + <'Certificate',c>
+        + <'Get_Challenge',ch>
+        + <'Challenge',cha>  
+        + <'Get_Measurement', gm> 
+"
+
+#ifdef fast
+restriction ResUniqueThreadsInit:
+"
+All tid oidI oidR oidI2 oidR2 #i #j. CurrentThreadI(tid,oidI,oidR)@i &
+                                     CurrentThreadI(tid,oidI2,oidR2)@j
+                                     ==> oidI=oidI2 & oidR=oidR2  
+"
+
+restriction ResUniqueThreadsResp:
+"
+All tid oidR oidR2 #i #j. CurrentThreadR(tid,oidR)@i &
+                          CurrentThreadR(tid,oidR2)@j
+                          ==> oidR=oidR2  
+"
+#endif
+
+
+lemma UniqueThreadsInit[reuse, use_induction]:
+"
+All tid oidI oidR oidI2 oidR2 #i #j. CurrentThreadI(tid,oidI,oidR)@i &
+                                     CurrentThreadI(tid,oidI2,oidR2)@j
+                                     ==> oidI=oidI2 & oidR=oidR2  
+"
+
+lemma UniqueThreadsResp[reuse, use_induction]:
+"
+All tid oidR oidR2 #i #j. CurrentThreadR(tid,oidR)@i &
+                          CurrentThreadR(tid,oidR2)@j
+                          ==> oidR=oidR2  
+"
+
+lemma SecretLtk[reuse, use_induction]:
+"
+ All oid pub ltk #i. Honest(oid,ltk,pub)@i ==> not(Ex #j. K(ltk)@j)   
+"
+
+lemma SecretRootkey[reuse, use_induction]:
+"
+ All ltk #i. CreateRootCert(ltk)@i ==> not(Ex #j. K(ltk)@j)   
+"
+
+lemma UniqueRootkey[reuse, use_induction]:
+"
+ All oid1 oid2 pubk1 pubk2 rootkey1 rootkey2 #i #j. 
+                                      CertificateKey(oid1,pubk1,rootkey1)@i 
+                                    & CertificateKey(oid2,pubk2,rootkey2)@j 
+                                    ==> rootkey1=rootkey2  
+"
+
+
+
+
+lemma CertOrigin[reuse, use_induction]:
+"
+All tid oidI oidR pkR certR #i.
+                    FinishCertificate(tid,oidI,oidR,pkR,certR)@#i
+                    ==>
+                    (Ex ltk #j. j<i & Honest(oidR,ltk,pkR)@j)
+                    |
+                    (Ex ltk #j. j<i & Attacker(oidR,ltk,pkR)@j)
+"
+
+
+lemma CertMeasOrdering[reuse, use_induction, heuristic=S]:
+"
+(All tidI oidI oidR pkR #j.
+             MeasurePk(tidI, oidI, oidR, pkR) @j
+             ==> 
+             Ex cert #i. FinishCertificate(tidI, oidI, oidR, pkR,cert)@i 
+             & i<j)
+& (All tidI oidI oidR pkR #i.
+            SuccessChallenge(tidI, oidI, oidR, pkR)@i
+            ==>
+            Ex cert #j. FinishCertificate(tidI, oidI, oidR, pkR,cert)@j & j<i    )   
+" 
+
+// Needs OptionTranscriptType
+lemma ChallengeAfterCertificate[reuse, use_induction]:
+"
+All tidI oidI oidR pkR #i.
+            SuccessChallenge(tidI, oidI, oidR, pkR)@i
+            ==>
+            Ex cert #j. FinishCertificate(tidI, oidI, oidR, pkR,cert)@j & j<i     
+"
+
+
+
+
+lemma ResponderAuth[reuse, use_induction, //heuristic=S,
+                      hide_lemma=ChallengeAfterCertificate,
+                      hide_lemma=UniqueRootkey,
+                      hide_lemma=SecretRootkey,
+                      hide_lemma=SecretLtk,
+                      hide_lemma=UniqueThreadsInit,
+                      hide_lemma=UniqueThreadsResp]:
+"
+All tidI oidI oidR pkR ltkR #i #n.
+            SuccessChallenge(tidI, oidI, oidR, pkR)@i
+            & Honest(oidR,ltkR, pkR)@n
+            ==>
+            (Ex tidR #j. RunningChallenge(tidR,oidR,ltkR)@j & j<i)
+"
+
+lemma MeasureAfterCert[reuse, use_induction]:
+"
+(All tidI oidI oidR pkR #j.
+             MeasurePk(tidI, oidI, oidR, pkR) @j
+             ==> 
+             Ex cert #i. FinishCertificate(tidI, oidI, oidR, pkR,cert)@i 
+             & i<j)
+"
+
+
+lemma NoArtificialLTKMeasure[use_induction,reuse]:
+"
+All tidI oidI oidR pkR sig #i.
+            ReceiveMeasurement(tidI, oidI, oidR, pkR, sig) @i
+             ==> 
+            (Ex ltkR #j. j<i & Honest(oidR,ltkR, pkR)@j)
+            |
+            (Ex ltkR oidR2 #j. j<i & Attacker(oidR2,ltkR,pkR)@j)
+"
+
+
+lemma RespOptionLoopBreaker[reuse,use_induction,heuristic=S]:
+"
+(All tid oid nonce #i. SendChallenge(tid, oid, nonce)@#i ==> (Ex #j. RespReachVCA(tid, oid)@#j & j<i ) )
+& (All tid oid cert #i. SendCertificate(tid, oid, cert)@#i  ==> (Ex #j. RespReachVCA(tid, oid)@#j & j<i ) )
+& (All tid oid digest #i. SendDigest(tid, oid, digest)@#i  ==> (Ex #j. RespReachVCA(tid, oid)@#j & j<i ) )
+& (All tid oid ltk meas #i. SendMeasurement(tid, oid, ltk, meas)@#i  ==> (Ex #j. RespReachVCA(tid, oid)@#j & j<i ) ) 
+"
+
+
+
+
+
+lemma Aliveness[reuse, use_induction, //heuristic=S,
+                      hide_lemma=ResponderAuth,
+                      hide_lemma=ResponderAuthenticationHonest,
+                      hide_lemma=CertMeasOrdering,
+                      hide_lemma=CertOrigin]:
+"
+All tidI oidI oidR ltkR pkR measure #i #n.
+            ReceiveMeasurement(tidI,oidI,oidR,pkR,measure)@i
+            & Honest(oidR,ltkR,pkR)@n
+            ==>
+            (Ex tidR #j. RespReachVCA(tidR,oidR)@j)
+"
+
+
+
+lemma MeasurementAuth[reuse, use_induction,
+                      hide_lemma=ResponderAuth,
+                      hide_lemma=ResponderAuthenticationHonest,
+                      //hide_lemma=CertMeasOrdering,
+                      //hide_lemma=CertOrigin,
+                      hide_lemma=ChallengeAfterCertificate,
+                      hide_lemma=UniqueRootkey,
+                      hide_lemma=SecretRootkey,
+                      hide_lemma=SecretLtk,
+                      hide_lemma=UniqueThreadsInit,
+                      hide_lemma=UniqueThreadsResp,
+                      hide_lemma=Aliveness,
+                      hide_lemma=NoArtificialLTKMeasure,
+                      hide_lemma=RespOptionLoopBreaker]:
+"
+All tidI oidI oidR ltkR pkR sig #i #n.
+            ReceiveMeasurement(tidI,oidI,oidR,pkR,sig)@i
+            & Honest(oidR,ltkR,pkR)@n
+            ==>
+            (Ex tidR #j. SendMeasurement(tidR,oidR,ltkR,sig)@j & j<i)
+"
+
+
+/*****************************************
+*
+* Attack on Measurement
+*
+*****************************************/
+// Reachability of Certificate RESP
+lemma MeasurementSanityCheck[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid oidR pkR sig ltk digest cert #i0 #i1 #i2 #i3 #i4.
+  Attacker(oidR, ltk, pkR)@i0
+  & InitReachVCA(tid, oid, oidR)@#i1
+  & ReceiveDigest(tid, oid,oidR, digest)@#i2
+  & ReceiveCertificate(tid, oid, oidR, cert)@#i3
+  & ReceiveMeasurement(tid,oid,oidR,pkR,sig)@i4
+  & i0<i1 & i1<i2 & i2<i3 & i3<i4
+  & not(Ex tidAny ltk #j. SendMeasurement(tidAny, oidR, ltk, sig)@#j)
+  & not(Ex tidAny nonce #j. SendChallenge(tidAny, oidR, nonce)@#j)
+  & not(Ex tidAny digest1 #j. SendDigest(tidAny, oidR, digest1)@#j)
+  & not(Ex tidAny digest1 #j. SendCertificate(tidAny, oidR, digest1)@#j)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 d1 d2 #x #y. ReceiveDigest(tid1,oid1,oidR1,d1)@#x & ReceiveDigest(tid2,oid2,oidR2,d2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 c1 c2 #x #y. ReceiveCertificate(tid1,oid1,oidR1,c1)@#x & ReceiveCertificate(tid2,oid2,oidR2,c2)@#y ==> #x=#y)
+  "
+
+
+
+/*****************************************
+*
+* Sanity Lemma
+*
+*****************************************/
+
+#ifdef Sanity
+
+// Reachability of the END VCA INIT
+lemma can_reach_VCA_init[heuristic=S]: exists-trace
+  "Ex tid oidI oidR #i.
+  InitReachVCA(tid,oidI,oidR) @ i"
+
+// Reachability of END VCA RESP
+lemma can_reach_VCA_resp[heuristic=S]: exists-trace
+  "Ex tid oid #i.
+  RespReachVCA(tid,oid)@#i"
+
+//
+//Digest
+//
+
+// Reachability of Get Digest Init
+lemma can_reach_req_digest_init[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid oidR #i #i2.
+  InitReachVCA(tid,oid,oidR)@#i
+  & RequestDigest(tid, oid, oidR)@#i2
+  & i<i2 
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestDigest(tid1,oid1,oidR1)@#x & RequestDigest(tid2,oid2,oidR2)@#y ==> #x=#y)"
+
+// Reachability of Receive Digest Init
+lemma can_reach_rec_digest_init[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid oidR digest #i #i2 #i3.
+  InitReachVCA(tid,oid,oidR)@#i
+  & RequestDigest(tid, oid, oidR)@#i2
+  & ReceiveDigest(tid, oid, oidR,digest)@#i3
+  & i<i2 & i2<i3
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestDigest(tid1,oid1,oidR1)@#x & RequestDigest(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 d1 d2 #x #y. ReceiveDigest(tid1,oid1,oidR1,d1)@#x & ReceiveDigest(tid2,oid2,oidR2,d2)@#y ==> #x=#y)"
+
+// Reachability of Digest RESP
+lemma can_reach_digest_resp[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid digest #i #i2.
+  RespReachVCA(tid,oid)@#i
+  & SendDigest(tid, oid, digest)@#i2
+  & i<i2 
+  & not(Ex tidAny ltk meas #j. SendMeasurement(tidAny, oid, ltk, meas)@#j)
+  & not(Ex tidAny cert #j. SendCertificate(tidAny, oid, cert)@#j)
+  & not(Ex tidAny nonce #j. SendChallenge(tidAny, oid, nonce)@#j)
+  & (All tid1 tid2 oid1 oid2 #x #y. RespReachVCA(tid1,oid1)@#x & RespReachVCA(tid2,oid2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 d1 d2 #x #y. SendDigest(tid1,oid1,d1)@#x & SendDigest(tid2,oid2,d2)@#y ==> #x=#y)"
+
+//
+//Certificate
+//
+
+// Reachability of Request Certificate Init
+lemma can_reach_req_cert_init[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid oidR digest #i #i2 #i3 #i4.
+  InitReachVCA(tid,oid,oidR)@#i
+  & RequestDigest(tid, oid, oidR)@#i2
+  & ReceiveDigest(tid, oid, oidR,digest)@#i3
+  & RequestCertificate(tid, oid, oidR)@#i4
+  & i<i2 & i2<i3 & i3<i4
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestDigest(tid1,oid1,oidR1)@#x & RequestDigest(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 d1 d2 #x #y. ReceiveDigest(tid1,oid1,oidR1,d1)@#x & ReceiveDigest(tid2,oid2,oidR2,d2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestCertificate(tid1,oid1,oidR1)@#x & RequestCertificate(tid2,oid2,oidR2)@#y ==> #x=#y)"
+
+// Reachability of Receive Certificate Init
+lemma can_reach_rec_cert_init[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid oidR digest cert #i #i2 #i3 #i4 #i5.
+  InitReachVCA(tid,oid,oidR)@#i
+  & RequestDigest(tid, oid, oidR)@#i2
+  & ReceiveDigest(tid, oid, oidR,digest)@#i3
+  & RequestCertificate(tid, oid, oidR)@#i4
+  & ReceiveCertificate(tid, oid, oidR, cert)@#i5
+  & i<i2 & i2<i3 & i3<i4 & i4<i5
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestDigest(tid1,oid1,oidR1)@#x & RequestDigest(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 d1 d2 #x #y. ReceiveDigest(tid1,oid1,oidR1,d1)@#x & ReceiveDigest(tid2,oid2,oidR2,d2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestCertificate(tid1,oid1,oidR1)@#x & RequestCertificate(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 c1 c2 #x #y. ReceiveCertificate(tid1,oid1,oidR1,c1)@#x & ReceiveCertificate(tid2,oid2,oidR2,c2)@#y ==> #x=#y)"
+
+
+// Reachability of Certificate RESP
+lemma can_reach_cert_resp[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid cert digest #i #i2 #i3.
+  RespReachVCA(tid,oid)@#i
+  & SendDigest(tid, oid, digest)@#i2
+  & SendCertificate(tid, oid, cert)@#i3
+  & i<i2 & i2<i3
+  & not(Ex tidAny ltk meas #j. SendMeasurement(tidAny, oid, ltk, meas)@#j)
+  & not(Ex tidAny nonce #j. SendChallenge(tidAny, oid, nonce)@#j)
+  & (All tid1 tid2 oid1 oid2 d1 d2 #x #y. SendDigest(tid1,oid1,d1)@#x & SendDigest(tid2,oid2,d2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 c1 c2 #x #y. SendCertificate(tid1,oid1,c1)@#x & SendCertificate(tid2,oid2,c2)@#y ==> #x=#y)
+  "
+
+//
+//Challenge
+//
+
+// Reachability of Request Challenge Init
+lemma can_reach_req_chall_init[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid oidR digest cert #i #i2 #i3 #i4 #i5 #i6.
+  InitReachVCA(tid,oid,oidR)@#i
+  & RequestDigest(tid, oid, oidR)@#i2
+  & ReceiveDigest(tid, oid, oidR,digest)@#i3
+  & RequestCertificate(tid, oid, oidR)@#i4
+  & ReceiveCertificate(tid, oid, oidR, cert)@#i5
+  & RequestChallenge(tid,oid,oidR)@i6
+  & i<i2 & i2<i3 & i3<i4 & i4<i5 & i5<i6
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestDigest(tid1,oid1,oidR1)@#x & RequestDigest(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 d1 d2 #x #y. ReceiveDigest(tid1,oid1,oidR1,d1)@#x & ReceiveDigest(tid2,oid2,oidR2,d2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestCertificate(tid1,oid1,oidR1)@#x & RequestCertificate(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 c1 c2 #x #y. ReceiveCertificate(tid1,oid1,oidR1,c1)@#x & ReceiveCertificate(tid2,oid2,oidR2,c2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestChallenge(tid1,oid1,oidR1)@#x & RequestChallenge(tid2,oid2,oidR2)@#y ==> #x=#y)
+  "
+
+// Reachability of Receive Challenge Init
+lemma can_reach_rec_chall_init[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid oidR digest cert sig #i #i2 #i3 #i4 #i5 #i6 #i7.
+  InitReachVCA(tid,oid,oidR)@#i
+  & RequestDigest(tid, oid, oidR)@#i2
+  & ReceiveDigest(tid, oid, oidR,digest)@#i3
+  & RequestCertificate(tid, oid, oidR)@#i4
+  & ReceiveCertificate(tid, oid, oidR, cert)@#i5
+  & RequestChallenge(tid,oid,oidR)@i6
+  & ReceiveChallenge(tid,oid,sig)@i7
+  & i<i2 & i2<i3 & i3<i4 & i4<i5 & i5<i6 & i6<i7
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. InitReachVCA(tid1,oid1,oidR1)@#x & InitReachVCA(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestDigest(tid1,oid1,oidR1)@#x & RequestDigest(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 d1 d2 #x #y. ReceiveDigest(tid1,oid1,oidR1,d1)@#x & ReceiveDigest(tid2,oid2,oidR2,d2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestCertificate(tid1,oid1,oidR1)@#x & RequestCertificate(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 c1 c2 #x #y. ReceiveCertificate(tid1,oid1,oidR1,c1)@#x & ReceiveCertificate(tid2,oid2,oidR2,c2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 #x #y. RequestChallenge(tid1,oid1,oidR1)@#x & RequestChallenge(tid2,oid2,oidR2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 s1 s2 #x #y. ReceiveChallenge(tid1,oid1,s1)@#x & ReceiveChallenge(tid2,oid2,s2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 c1 c2 #x #y. SendCertificate(tid1,oid1,c1)@#x & SendCertificate(tid2,oid2,c2)@#y ==> #x=#y)
+ "
+
+
+//
+//Measurements
+//
+
+
+// Reachability of Measurement RESP
+/*Manual proof
+lemma can_reach_measure_resp[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid ltk meas digest cert #i #i2 #i3 #i4.
+  RespReachVCA(tid,oid)@#i
+  & SendDigest(tid, oid, digest)@#i2
+  & SendCertificate(tid, oid, cert)@#i3
+  & SendMeasurement(tid, oid, ltk, meas)@#i4
+  & i<i2 & i2<i3 & i3<i4
+  & not(Ex tidAny nonce #j. SendChallenge(tidAny, oid, nonce)@#j)
+  & (All tid1 tid2 oid1 oid2 #x #y. RespReachVCA(tid1,oid1)@#x & RespReachVCA(tid2,oid2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 d1 d2 #x #y. SendDigest(tid1,oid1,d1)@#x & SendDigest(tid2,oid2,d2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 c1 c2 #x #y. SendCertificate(tid1,oid1,c1)@#x & SendCertificate(tid2,oid2,c2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 l1 l2 m1 m2 #x #y. SendMeasurement(tid1,oid1,l1,m1)@#x & SendMeasurement(tid2,oid2,l2,m2)@#y ==> #x=#y)
+  "
+*/
+
+lemma can_reach_rec_measure_init[heuristic=S,hide_lemma=RespOptionLoopBreaker]: exists-trace
+  "Ex tid oid oidR pkR sig digest cert #i1 #i2 #i3 #i4.
+  InitReachVCA(tid, oid, oidR)@#i1
+  & ReceiveDigest(tid, oid,oidR, digest)@#i2
+  & ReceiveCertificate(tid, oid, oidR, cert)@#i3
+  & ReceiveMeasurement(tid,oid,oidR,pkR,sig)@i4
+  & i1<i2 & i2<i3 & i3<i4
+  & not(Ex tidAny ltk #j. SendMeasurement(tidAny, oidR, ltk, sig)@#j)
+  & not(Ex tidAny nonce #j. SendChallenge(tidAny, oidR, nonce)@#j)
+  & not(Ex tidAny digest1 #j. SendDigest(tidAny, oidR, digest1)@#j)
+  & not(Ex tidAny digest1 #j. SendCertificate(tidAny, oidR, digest1)@#j)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 d1 d2 #x #y. ReceiveDigest(tid1,oid1,oidR1,d1)@#x & ReceiveDigest(tid2,oid2,oidR2,d2)@#y ==> #x=#y)
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 c1 c2 #x #y. ReceiveCertificate(tid1,oid1,oidR1,c1)@#x & ReceiveCertificate(tid2,oid2,oidR2,c2)@#y ==> #x=#y)
+  "
+
+
+lemma can_reach_req_measure_init_shared[heuristic=S,hide_lemma=RespOptionLoopBreaker,
+                                                    hide_lemma=CertMeasOrdering,
+                                                    hide_lemma=MeasureAfterCert]: exists-trace
+  "Ex tid oid oidR #i1 #i4.
+  InitReachVCA(tid, oid, oidR)@#i1
+  & RequestMeasurementPK(tid,oid,oidR)@i4
+  & i1<i4
+  & not(Ex tidAny nonce #j. SendChallenge(tidAny, oidR, nonce)@#j)
+  & not(Ex tidAny digest1 #j. SendDigest(tidAny, oidR, digest1)@#j)
+  & not(Ex tidAny digest1 #j. SendCertificate(tidAny, oidR, digest1)@#j)
+  & not(Ex tidAny oid1 oidR1 digest1 #j. ReceiveDigest(tidAny, oid1, oidR1, digest1)@#j)
+  & not(Ex tidAny oid1 oidR1 cert1 #j. ReceiveCertificate(tidAny, oid1, oidR1, cert1)@#j)
+  "
+/*Manual proof
+lemma can_reach_rec_measure_init_shared[heuristic=S,hide_lemma=RespOptionLoopBreaker,
+                                                    hide_lemma=CertMeasOrdering,
+                                                    hide_lemma=MeasureAfterCert]: exists-trace
+  "Ex tid oid oidR pkR sig #i1 #i4.
+  InitReachVCA(tid, oid, oidR)@#i1
+  & ReceiveMeasurementShared(tid,oid,oidR,pkR,sig)@i4
+  & i1<i4
+  & (All tid1 tid2 oid1 oid2 oidR1 oidR2 pk1 pk2 s1 s2 #x #y. ReceiveMeasurementShared(tid1,oid1,oidR1,pk1, s1)@#x & ReceiveMeasurementShared(tid2,oid2,oidR2,pk2,s2)@#y ==> #x=#y)
+  & not(Ex tidAny nonce #j. SendChallenge(tidAny, oidR, nonce)@#j)
+  & not(Ex tidAny digest1 #j. SendDigest(tidAny, oidR, digest1)@#j)
+  & not(Ex tidAny digest1 #j. SendCertificate(tidAny, oidR, digest1)@#j)
+  & not(Ex tidAny oid1 oidR1 digest1 #j. ReceiveDigest(tidAny, oid1, oidR1, digest1)@#j)
+  & not(Ex tidAny oid1 oidR1 cert1 #j. ReceiveCertificate(tidAny, oid1, oidR1, cert1)@#j)
+  "
+/*
+#endif
+
+
+end
